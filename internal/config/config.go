@@ -71,6 +71,15 @@ func Path() (string, error) {
 	return filepath.Join(dir, "nico-seiga-archiver", "config.json"), nil
 }
 
+// HistoryPath 返回命令历史文件路径（与配置文件同目录）。
+func HistoryPath() (string, error) {
+	p, err := Path()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(filepath.Dir(p), "history"), nil
+}
+
 // Load 读取配置；文件不存在时返回默认配置。
 func Load() (*Config, string, error) {
 	path, err := Path()

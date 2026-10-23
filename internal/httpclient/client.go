@@ -160,6 +160,10 @@ func (c *Client) doWithRetry(ctx context.Context, method, rawurl string, body io
 		}
 		resp, err := c.HTTP.Do(req)
 		if err != nil {
+			// 用户取消（Ctrl+C）或超时：不再重试，也不打重试日志。
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
 			lastErr = err
 			if attempt < maxAttempts && retryableError(err) {
 				wait := time.Duration(attempt) * 2 * time.Second

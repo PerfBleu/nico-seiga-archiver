@@ -1,0 +1,7 @@
+# 构建产物
+/dist/
+/archiver
+/archiver.exe
+*.exe
+*.test
+*.out

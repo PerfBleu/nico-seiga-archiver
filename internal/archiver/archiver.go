@@ -21,6 +21,9 @@ import (
 	"nico-seiga-archiver/internal/util"
 )
 
+// ErrCanceled 表示用户主动放弃了某个操作（例如在密码提示处按 Ctrl+C）。
+var ErrCanceled = errors.New("用户取消")
+
 // Stats 统计一次任务的结果。
 type Stats struct {
 	Illusts      int
@@ -105,6 +108,9 @@ func (a *Archiver) destDirFor(author string) string {
 func (a *Archiver) ProcessIllust(ctx context.Context, rawURL string) (*nico.Illust, error) {
 	ill, err := a.nico.FetchIllust(ctx, rawURL)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		a.stats.IllustErrors++
 		return nil, err
 	}
@@ -184,6 +190,11 @@ func (a *Archiver) downloadLink(ctx context.Context, ill *nico.Illust, link extr
 			a.log.Warnf("  %s", reason)
 			np, perr := a.AskPassword(hint)
 			if perr != nil {
+				if errors.Is(perr, ErrCanceled) {
+					a.stats.Skipped++
+					a.log.Infof("  已跳过该链接（用户取消）")
+					return
+				}
 				lastErr = perr
 				break
 			}
@@ -198,6 +209,12 @@ func (a *Archiver) downloadLink(ctx context.Context, ill *nico.Illust, link extr
 	}
 
 	a.stats.FailedFiles++
+	if ctx.Err() != nil {
+		// Ctrl+C 取消任务时不记成失败，避免污染元数据。
+		a.stats.FailedFiles--
+		a.log.Warnf("  已取消: %s", link.URL)
+		return
+	}
 	a.log.Errorf("  下载失败: %s (%v)", link.URL, lastErr)
 	_ = a.store.Add(metadata.Record{
 		NicoURL:        ill.URL,
@@ -266,6 +283,9 @@ func (a *Archiver) ProcessList(ctx context.Context, rawURL string, startPage int
 				return err
 			}
 			if _, err := a.ProcessIllust(ctx, item.URL); err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
 				a.log.Errorf("处理投稿失败 %s: %v", item.URL, err)
 			}
 		}
@@ -293,13 +313,22 @@ func (a *Archiver) DirectDownload(ctx context.Context, guURL, password string) (
 	res, err := a.gu.Download(ctx, guURL, password, a.cfg.DownloadDir, a.Force)
 	if err != nil && (errors.Is(err, getuploader.ErrPasswordRequired) || errors.Is(err, getuploader.ErrPasswordRejected)) {
 		if a.AskPassword != nil && a.cfg.AskPassword {
-			if np, perr := a.AskPassword("getuploader 下载页\n" + guURL); perr == nil && strings.TrimSpace(np) != "" {
+			np, perr := a.AskPassword("getuploader 下载页\n" + guURL)
+			if errors.Is(perr, ErrCanceled) {
+				a.log.Infof("已取消该下载。")
+				return nil, nil
+			}
+			if perr == nil && strings.TrimSpace(np) != "" {
 				password = strings.TrimSpace(np)
 				res, err = a.gu.Download(ctx, guURL, password, a.cfg.DownloadDir, a.Force)
 			}
 		}
 	}
 	if err != nil {
+		if ctx.Err() != nil {
+			a.log.Warnf("已取消: %s", guURL)
+			return nil, ctx.Err()
+		}
 		a.stats.FailedFiles++
 		_ = a.store.Add(metadata.Record{
 			GetuploaderURL: guURL,

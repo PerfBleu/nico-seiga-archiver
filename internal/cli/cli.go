@@ -2,7 +2,6 @@
 package cli
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -16,11 +15,14 @@ import (
 	"nico-seiga-archiver/internal/config"
 	"nico-seiga-archiver/internal/logx"
 	"nico-seiga-archiver/internal/nico"
+	"nico-seiga-archiver/internal/prompt"
 	"nico-seiga-archiver/internal/proxy"
 	"nico-seiga-archiver/internal/util"
 )
 
-const version = "0.1.0"
+// version 由 Makefile 通过 -ldflags "-X .../internal/cli.version=<git commit>" 注入；
+// 直接用 `go run` / `go build` 构建时为 dev。
+var version = "dev"
 
 const banner = `
   ┌──────────────────────────────────────────────────────────┐
@@ -30,12 +32,13 @@ const banner = `
 
 // CLI 是交互式命令行状态。
 type CLI struct {
-	cfg     *config.Config
-	cfgPath string
-	log     *logx.Logger
-	arch    *archiver.Archiver
-	in      *bufio.Reader
-	out     io.Writer
+	cfg         *config.Config
+	cfgPath     string
+	historyPath string
+	log         *logx.Logger
+	arch        *archiver.Archiver
+	pr          *prompt.Reader
+	out         io.Writer
 }
 
 // New 创建 CLI。
@@ -49,17 +52,28 @@ func New() (*CLI, error) {
 	cfg.Normalize()
 	level := parseLevel(cfg.LogLevel)
 	logger := logx.New(os.Stdout, level)
-	return &CLI{
+	pr := prompt.New(os.Stdin, os.Stdout)
+	c := &CLI{
 		cfg:     cfg,
 		cfgPath: path,
 		log:     logger,
-		in:      bufio.NewReaderSize(os.Stdin, 64*1024),
+		pr:      pr,
 		out:     os.Stdout,
-	}, nil
+	}
+	if hp, err := config.HistoryPath(); err == nil {
+		c.historyPath = hp
+		_ = pr.LoadHistory(hp)
+	}
+	pr.SetCompleter(completeCommand)
+	return c, nil
 }
 
 // Run 启动 REPL；args 非空时以非交互方式执行一条命令。
 func (c *CLI) Run(args []string) int {
+	defer func() {
+		c.saveHistory()
+		c.pr.Close()
+	}()
 	c.printBanner()
 
 	if len(args) > 0 {
@@ -67,6 +81,10 @@ func (c *CLI) Run(args []string) int {
 		defer stop()
 		_, err := c.execute(ctx, strings.Join(args, " "))
 		if err != nil {
+			if isCancelled(err) {
+				c.log.Warnf("已取消。")
+				return 130
+			}
 			c.log.Errorf("%v", err)
 			return 1
 		}
@@ -74,41 +92,117 @@ func (c *CLI) Run(args []string) int {
 	}
 
 	for {
-		line, err := c.prompt("archiver> ")
+		line, err := c.pr.Line("archiver> ")
 		if err != nil {
-			if errors.Is(err, io.EOF) {
+			switch {
+			case errors.Is(err, prompt.ErrInterrupted):
+				// 顶层没有「上一级」，Ctrl+C 就是退出。
+				fmt.Fprintln(c.out)
+				c.log.Infof("已退出。")
+				return 0
+			case errors.Is(err, io.EOF):
 				fmt.Fprintln(c.out)
 				return 0
+			default:
+				c.log.Errorf("读取输入失败: %v", err)
+				return 1
 			}
-			c.log.Errorf("读取输入失败: %v", err)
-			return 1
 		}
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
+		if !isSecretCommand(line) {
+			c.pr.AddHistory(line)
+		}
 		rootCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 		exit, err := c.execute(rootCtx, line)
 		stop()
-		if err != nil {
+		switch {
+		case err == nil:
+		case errors.Is(err, prompt.ErrInterrupted):
+			c.log.Warnf("已取消当前操作，返回命令提示符。")
+		case isCancelled(err):
+			c.log.Warnf("已取消当前任务，返回命令提示符。")
+		default:
 			c.log.Errorf("%v", err)
 		}
 		if exit {
+			c.log.Infof("已退出。")
 			return 0
 		}
 	}
 }
 
-// prompt 读取一行输入；在读输入时忽略 Ctrl-C，避免直接退出。
-func (c *CLI) prompt(p string) (string, error) {
-	fmt.Fprint(c.out, p)
-	signal.Ignore(os.Interrupt)
-	defer signal.Reset(os.Interrupt)
-	line, err := c.in.ReadString('\n')
-	if err != nil && line == "" {
-		return "", err
+// promptLine 读取一行输入（历史 + 行内编辑）。
+func (c *CLI) promptLine(p string) (string, error) {
+	return c.pr.Line(p)
+}
+
+// promptPassword 读取密码（不回显）。
+func (c *CLI) promptPassword(p string) (string, error) {
+	return c.pr.Password(p)
+}
+
+func (c *CLI) saveHistory() {
+	if c.historyPath == "" {
+		return
 	}
-	return strings.TrimRight(line, "\r\n"), nil
+	if err := c.pr.SaveHistory(c.historyPath); err != nil {
+		c.log.Debugf("保存命令历史失败: %v", err)
+	}
+}
+
+// isCancelled 判断错误是否来自 Ctrl+C 触发的 context 取消。
+func isCancelled(err error) bool {
+	return errors.Is(err, context.Canceled)
+}
+
+// isSecretCommand 判断命令是否包含敏感信息（不写入命令历史）。
+func isSecretCommand(line string) bool {
+	fields := util.SplitArgs(line)
+	if len(fields) < 3 {
+		return false
+	}
+	if !strings.EqualFold(fields[0], "cfg") && !strings.EqualFold(fields[0], "config") {
+		return false
+	}
+	if !strings.EqualFold(fields[1], "set") {
+		return false
+	}
+	switch strings.ToLower(fields[2]) {
+	case "cookie", "nico_cookie", "nicocookie", "user_agent", "ua":
+		return true
+	}
+	return false
+}
+
+// completeCommand 提供命令名的 Tab 补全。
+func completeCommand(line string) []string {
+	fields := strings.Fields(line)
+	if len(fields) > 1 {
+		return nil
+	}
+	prefix := ""
+	if len(fields) == 1 {
+		prefix = fields[0]
+		if strings.HasSuffix(line, " ") {
+			return nil
+		}
+	}
+	var out []string
+	for _, cmd := range commandNames {
+		if strings.HasPrefix(cmd, prefix) {
+			out = append(out, cmd)
+		}
+	}
+	return out
+}
+
+var commandNames = []string{
+	"help", "version", "exit", "quit", "clear",
+	"nico-search", "nico-author", "nico-down", "down",
+	"cfg", "probe", "stats",
 }
 
 func (c *CLI) printBanner() {
@@ -127,6 +221,9 @@ func (c *CLI) printBanner() {
 		fmt.Fprintf(c.out, "  提示      : 未设置 nico Cookie（可选）。遇到仅登录可见的投稿时，输入 cfg 设置。\n")
 	}
 	fmt.Fprintln(c.out, "  输入 help 查看可用命令。")
+	if c.pr.Interactive() {
+		fmt.Fprintln(c.out, "  ↑/↓ 翻命令历史 · Tab 补全 · Ctrl+C 取消当前操作 / 在提示符处退出")
+	}
 	fmt.Fprintln(c.out)
 }
 
@@ -320,14 +417,22 @@ func (c *CLI) cmdProbe(ctx context.Context, a *archiver.Archiver) error {
 }
 
 // askPassword 在自动取不到密码时询问用户。
+// 用户按 Ctrl+C 时返回 archiver.ErrCanceled，表示放弃这一个下载（回到命令提示符）。
 func (c *CLI) askPassword(hint string) (string, error) {
 	fmt.Fprintln(c.out)
-	fmt.Fprintln(c.out, "  ── 需要下载密码 ──")
+	fmt.Fprintln(c.out, "  ── 需要下载密码（Ctrl+C 跳过此链接）──")
 	for _, line := range strings.Split(hint, "\n") {
 		fmt.Fprintf(c.out, "  %s\n", line)
 	}
-	v, err := c.prompt("  请输入密码（直接回车跳过）: ")
-	if err != nil && !errors.Is(err, io.EOF) {
+	v, err := c.promptPassword("  请输入密码（直接回车跳过）: ")
+	if err != nil {
+		if errors.Is(err, prompt.ErrInterrupted) {
+			fmt.Fprintln(c.out)
+			return "", archiver.ErrCanceled
+		}
+		if errors.Is(err, io.EOF) {
+			return "", nil
+		}
 		return "", err
 	}
 	return strings.TrimSpace(v), nil
@@ -366,14 +471,31 @@ func (c *CLI) cfgCommand(ctx context.Context, args []string) error {
 
 func (c *CLI) cfgWizard(_ context.Context) error {
 	fmt.Fprintln(c.out)
-	fmt.Fprintln(c.out, "== 配置向导（直接回车保留当前值）==")
+	fmt.Fprintln(c.out, "== 配置向导（直接回车保留当前值，Ctrl+C 取消并返回）==")
 
-	c.askInto("下载目录", &c.cfg.DownloadDir, func(v string) error {
+	// 任一步骤按 Ctrl+C 都放弃整个向导，不保存。
+	if err := c.cfgAskAll(); err != nil {
+		if errors.Is(err, prompt.ErrInterrupted) {
+			fmt.Fprintln(c.out)
+			c.log.Warnf("已取消配置，改动未保存。")
+			return nil
+		}
+		return err
+	}
+	c.cfg.Normalize()
+	return c.saveConfig()
+}
+
+// cfgAskAll 依次询问所有配置项。
+func (c *CLI) cfgAskAll() error {
+	if err := c.askInto("下载目录", &c.cfg.DownloadDir, func(v string) error {
 		if strings.TrimSpace(v) == "" {
 			return errors.New("不能为空")
 		}
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
 
 	pr := proxy.Resolve(c.cfg.Proxy)
 	proxyHint := "auto"
@@ -381,15 +503,23 @@ func (c *CLI) cfgWizard(_ context.Context) error {
 		proxyHint = fmt.Sprintf("当前系统代理: %s (%s)", pr.URL, pr.Source)
 	}
 	fmt.Fprintf(c.out, "  代理说明: auto=读取系统代理，none=直连，也可以直接填 http://host:port\n")
-	c.askInto("代理 "+proxyHint, &c.cfg.Proxy, nil)
+	if err := c.askInto("代理 "+proxyHint, &c.cfg.Proxy, nil); err != nil {
+		return err
+	}
 
 	fmt.Fprintf(c.out, "  nico Cookie: 浏览器登录 seiga 后，复制请求头里的整段 Cookie（含 user_session=...）\n")
-	c.askInto("nico Cookie "+c.cfg.MaskedCookie(), &c.cfg.NicoCookie, nil)
+	if err := c.askInto("nico Cookie "+c.cfg.MaskedCookie(), &c.cfg.NicoCookie, nil); err != nil {
+		return err
+	}
 
-	c.askInto("User-Agent", &c.cfg.UserAgent, nil)
+	if err := c.askInto("User-Agent", &c.cfg.UserAgent, nil); err != nil {
+		return err
+	}
 
 	var delay string
-	c.askInto(fmt.Sprintf("请求间隔毫秒（当前 %d）", c.cfg.DelayMS), &delay, nil)
+	if err := c.askInto(fmt.Sprintf("请求间隔毫秒（当前 %d）", c.cfg.DelayMS), &delay, nil); err != nil {
+		return err
+	}
 	if delay != "" {
 		if n, err := strconv.Atoi(delay); err == nil && n >= 0 {
 			c.cfg.DelayMS = n
@@ -398,7 +528,9 @@ func (c *CLI) cfgWizard(_ context.Context) error {
 		}
 	}
 	var timeout string
-	c.askInto(fmt.Sprintf("请求超时秒（当前 %d）", c.cfg.TimeoutSec), &timeout, nil)
+	if err := c.askInto(fmt.Sprintf("请求超时秒（当前 %d）", c.cfg.TimeoutSec), &timeout, nil); err != nil {
+		return err
+	}
 	if timeout != "" {
 		if n, err := strconv.Atoi(timeout); err == nil && n > 0 {
 			c.cfg.TimeoutSec = n
@@ -411,14 +543,13 @@ func (c *CLI) cfgWizard(_ context.Context) error {
 	if !c.cfg.AskPassword {
 		cur = "n"
 	}
-	c.askInto("找不到密码时询问 (y/n) ["+cur+"]", &ask, nil)
+	if err := c.askInto("找不到密码时询问 (y/n) ["+cur+"]", &ask, nil); err != nil {
+		return err
+	}
 	if ask != "" {
 		c.cfg.AskPassword = strings.EqualFold(ask, "y") || strings.EqualFold(ask, "yes") || ask == "是"
 	}
-	c.askInto("日志级别 (debug/info/warn/error)", &c.cfg.LogLevel, nil)
-
-	c.cfg.Normalize()
-	return c.saveConfig()
+	return c.askInto("日志级别 (debug/info/warn/error)", &c.cfg.LogLevel, nil)
 }
 
 func (c *CLI) cfgSet(key, value string) error {
@@ -502,23 +633,27 @@ func (c *CLI) showConfig() {
 	fmt.Fprintln(c.out)
 }
 
-func (c *CLI) askInto(label string, dst *string, validate func(string) error) {
-	fmt.Fprintf(c.out, "  %s\n    > ", label)
-	line, err := c.in.ReadString('\n')
-	if err != nil && line == "" {
-		return
+func (c *CLI) askInto(label string, dst *string, validate func(string) error) error {
+	fmt.Fprintf(c.out, "  %s\n", label)
+	v, err := c.promptLine("    > ")
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		return err
 	}
-	v := strings.TrimSpace(strings.TrimRight(line, "\r\n"))
+	v = strings.TrimSpace(v)
 	if v == "" {
-		return
+		return nil
 	}
 	if validate != nil {
 		if err := validate(v); err != nil {
 			c.log.Warnf("%v（保留原值）", err)
-			return
+			return nil
 		}
 	}
 	*dst = v
+	return nil
 }
 
 // ---------- help ----------
@@ -574,6 +709,16 @@ cfg path                   打印配置文件路径
 cfg test                   检查 nico / getuploader 连通性
 cfg reset                  恢复默认配置
 `)
+	case "keys", "keyboard":
+		fmt.Fprint(c.out, `
+键盘操作（需要 stdin 是终端）：
+  ↑ / ↓            翻阅命令历史（跨会话保存）
+  ← / →            移动光标        Home/End (Ctrl+A/Ctrl+E)  行首/行尾
+  Ctrl+W           删除一个词      Ctrl+K   删除光标到行尾
+  Ctrl+R           反向搜索历史     Ctrl+Y   粘贴上次删除的内容
+  Tab              补全命令名
+  Ctrl+C           取消当前操作 / 返回上级 / 退出
+`)
 	default:
 		fmt.Fprintf(c.out, `
 可用命令：
@@ -584,8 +729,14 @@ cfg reset                  恢复默认配置
   cfg [show|set|path|test|reset]    配置（Cookie / 下载目录 / 代理等）
   probe                             检查 nico / getuploader 连通性
   stats                             显示本次会话的统计
-  help [命令]                       查看详细帮助
+  help [命令]                       查看详细帮助（help keys 查看快捷键）
   exit | quit                       退出
+
+Ctrl+C 的行为：
+  - 任务运行中    取消当前任务，回到 archiver> 提示符
+  - 配置向导中    放弃本次配置，改动不保存，回到提示符
+  - 密码询问中    跳过这一个链接，回到提示符
+  - 在提示符处    退出程序（等同 exit）
 
 通用参数：
   --force / -f   即使文件已存在也重新下载
