@@ -256,12 +256,11 @@ func (c *CLI) printBanner() {
 	if strings.TrimSpace(c.cfg.NicoCookie) == "" {
 		fmt.Fprintf(c.out, "  提示      : 未设置 nico Cookie（可选）。遇到仅登录可见的投稿时，输入 cfg 设置。\n")
 	}
-	fmt.Fprintln(c.out, "  输入 help 查看可用命令。")
 	if c.pr.Interactive() {
-		fmt.Fprintln(c.out, "  也可以直接用命令行参数调用：archiver --help")
-		fmt.Fprintln(c.out, "  ↑/↓ 翻命令历史 · Tab 补全 · Ctrl+C 取消当前操作 / 在提示符处退出")
+		fmt.Fprintln(c.out, "  ↑/↓ 翻命令历史 · Tab 补全（帮助见下方，快捷键见 help keys）")
 	}
-	fmt.Fprintln(c.out)
+	// 启动时直接展示帮助，省去用户先输入 help。
+	c.showHelp(nil)
 }
 
 func (c *CLI) execute(ctx context.Context, line string) (exit bool, err error) {
