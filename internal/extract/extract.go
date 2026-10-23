@@ -41,12 +41,26 @@ func PasswordAlternates(p string) []string {
 	return out
 }
 
+// 关键词与密码之间可能出现的连接符/助词。两边用 pwGap 允许空白（最多跨一行）。
+const (
+	pwGap = `[ \t\x{3000}]*(?:\r?\n[ \t\x{3000}]*)?`
+	// 连接符：日文助词、冒号、等号、箭头、破折号、括号开头等
+	pwSep = `(?:は|を|が|:|：|=|＝|＞|>|→|⇒|≫|-|–|—|ー|【|\[|（|\(|「|『|、|，|,)?`
+	// 密码本体：ASCII 可见字符；全角字符在归一化视图里会映射成半角后再匹配。
+	pwBody = `([A-Za-z0-9!@#$%^&*_\-\.]{2,24})`
+)
+
 var (
 	// 允许省略 scheme，也允许 getuploader.com 的各种子域名。
 	reURL = regexp.MustCompile(`(?i)(?:https?://)?(?:[a-z0-9-]+\.)*getuploader\.com/[^\s<>"' \x{3000}【】（）()「」『』\[\]]+`)
 
-	// 带关键词的密码，例如「パスワード：2525」「pass【2525】」「pw=2525」
-	rePassKeyword = regexp.MustCompile(`(?i)(?:パスワード|パスコード|合言葉|暗証番号|パス|キーコード|キー|pass(?:word)?|pw|key)\s*(?:は|を|:|：|=|＝|＞|>|-|–|—|【|\[|（|\(|「|『)?\s*([A-Za-z0-9!@#$%^&*_\-\.]{2,24})`)
+	// 日文关键词：パスワード / パスワードは / パスコード / パス / キー 等。
+	// 长的写在前面，保证「パスワード」不会被「パス」抢先匹配。
+	rePassJP = regexp.MustCompile(`(?:ダウンロードパスワード|パスワード|パスコード|暗証番号|合言葉|キーコード|パスキー|パス|キー)` + pwGap + pwSep + pwGap + pwBody)
+
+	// 英文关键词：password / pass / pw / pwd / passwd / passcode / key。
+	// 用 \b 避免匹配到 bypass、keyword 之类单词内部。
+	rePassEN = regexp.MustCompile(`(?i)\b(?:password|passwd|passcode|pwd|pass|pw|key)\b` + pwGap + pwSep + pwGap + pwBody)
 
 	// URL 后面紧跟的数字/字母组合，例如「.../download/71 2525」
 	reAfterURLDigits = regexp.MustCompile(`^[\s\x{3000}、,，。:：=＝\-–—|｜/／]*([A-Za-z0-9]{3,16})\b`)
@@ -56,6 +70,9 @@ var (
 
 	// 前置文本里的裸数字密码，例如「2525 https://...」
 	reBareDigits = regexp.MustCompile(`(?:^|[\s\x{3000}、,，/／|｜:：=＝【\[（(「『])(\d{3,8})(?:$|[\s\x{3000}、,，/／|｜】\]）)」』])`)
+
+	// 所有「关键词 + 密码」形式的正则，按顺序尝试，取最靠近 URL 的那个。
+	keywordPatterns = []*regexp.Regexp{rePassJP, rePassEN}
 
 	reTrailing = `.,;:!?'"”’、。，；：！？】」』）)]}`
 )
@@ -175,7 +192,7 @@ func passwordInSegment(orig, norm []rune, urlEnd int) (string, string) {
 	}
 
 	// 1) 优先看 URL 之后（同一段内）的密码，避免把上一个链接的密码误用。
-	if pw := matchPassword(afterO, afterN, rePassKeyword, 1); pw != "" {
+	if pw, _ := findKeywordPassword(afterO, afterN); pw != "" {
 		return pw, "keyword"
 	}
 	// 2) URL 紧跟括号内容。
@@ -192,7 +209,7 @@ func passwordInSegment(orig, norm []rune, urlEnd int) (string, string) {
 		return pw, "after-url"
 	}
 	// 4) 再看看 URL 前面的最后一段文字。
-	if pw := matchPassword(beforeO, beforeN, rePassKeyword, 1); pw != "" {
+	if pw, _ := findKeywordPassword(beforeO, beforeN); pw != "" {
 		return pw, "keyword-before"
 	}
 	// 5) 前置文本里找「4 位数字」这种最常见的手写密码。
@@ -232,6 +249,43 @@ func matchPassword(orig, norm []rune, re *regexp.Regexp, group int) string {
 	return cleanPassword(rawPW, normPW)
 }
 
+// findKeywordPassword 在所有「关键词 + 密码」正则里找出离片段开头最近的一个密码。
+// 返回 (密码, 密码在原片段中的起始 rune 下标)。
+func findKeywordPassword(orig, norm []rune) (string, int) {
+	if len(norm) == 0 {
+		return "", -1
+	}
+	s := string(norm)
+	bestPos := -1
+	bestPW := ""
+	for _, re := range keywordPatterns {
+		for _, loc := range re.FindAllStringSubmatchIndex(s, -1) {
+			if len(loc) < 4 || loc[2] < 0 || loc[3] < 0 {
+				continue
+			}
+			gs := utf8.RuneCountInString(s[:loc[2]])
+			ge := utf8.RuneCountInString(s[:loc[3]])
+			if ge > len(orig) || gs >= ge {
+				continue
+			}
+			pw := cleanPassword(string(orig[gs:ge]), string(norm[gs:ge]))
+			if pw == "" {
+				continue
+			}
+			// 同一个密码可能被两个正则同时命中，保留位置更靠前的那个。
+			if bestPos < 0 || gs < bestPos {
+				bestPos = gs
+				bestPW = pw
+			}
+			break // 该正则只取第一个有效匹配
+		}
+	}
+	if bestPos < 0 {
+		return "", -1
+	}
+	return bestPW, bestPos
+}
+
 // cleanPassword 清理候选密码；raw 保留原始宽度，norm 仅用于关键词排除等判断。
 func cleanPassword(raw, norm string) string {
 	raw = strings.TrimSpace(raw)
@@ -265,18 +319,16 @@ func ToHalfWidth(s string) string {
 
 func toHalfWidthRune(r rune) rune {
 	switch {
+	case r == '　': // 全角空格
+		return ' '
 	case r >= '０' && r <= '９':
 		return '0' + (r - '０')
 	case r >= 'Ａ' && r <= 'Ｚ':
 		return 'A' + (r - 'Ａ')
 	case r >= 'ａ' && r <= 'ｚ':
 		return 'a' + (r - 'ａ')
-	case r == '：':
-		return ':'
-	case r == '＝':
-		return '='
-	case r == '　':
-		return ' '
+	case r >= '！' && r <= '～': // 全角 ASCII 符号区（U+FF01–U+FF5E）
+		return r - 0xFEE0
 	default:
 		return r
 	}
