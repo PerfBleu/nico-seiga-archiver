@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -201,8 +202,8 @@ func completeCommand(line string) []string {
 
 var commandNames = []string{
 	"help", "version", "exit", "quit", "clear",
-	"nico-search", "nico-author", "nico-down", "down",
-	"cfg", "probe", "stats",
+	"nico-search", "nico-tag", "nico-author", "nico-down", "down",
+	"cfg", "progress", "probe", "stats",
 }
 
 func (c *CLI) printBanner() {
@@ -236,6 +237,7 @@ func (c *CLI) execute(ctx context.Context, line string) (exit bool, err error) {
 	// 提取通用 flag。
 	force := false
 	dryRun := false
+	restart := false
 	filtered := args[:0]
 	for _, a := range args {
 		switch a {
@@ -243,6 +245,8 @@ func (c *CLI) execute(ctx context.Context, line string) (exit bool, err error) {
 			force = true
 		case "--dry-run", "-n":
 			dryRun = true
+		case "--restart":
+			restart = true
 		case "--debug":
 			c.cfg.LogLevel = "debug"
 			c.rebuild()
@@ -282,6 +286,7 @@ func (c *CLI) execute(ctx context.Context, line string) (exit bool, err error) {
 	}
 	arch.Force = force
 	arch.DryRun = dryRun
+	arch.Restart = restart
 	arch.ResetStats()
 
 	switch cmd {
@@ -289,6 +294,8 @@ func (c *CLI) execute(ctx context.Context, line string) (exit bool, err error) {
 		return false, c.cmdNicoSearch(ctx, arch, rest)
 	case "nico-author", "author", "na":
 		return false, c.cmdNicoAuthor(ctx, arch, rest)
+	case "nico-tag", "tag", "nt":
+		return false, c.cmdNicoTag(ctx, arch, rest)
 	case "nico-down", "nico", "nd":
 		return false, c.cmdNicoDown(ctx, arch, rest)
 	case "down", "d":
@@ -298,6 +305,8 @@ func (c *CLI) execute(ctx context.Context, line string) (exit bool, err error) {
 	case "stats":
 		c.log.Infof("%s", arch.Stats().String())
 		return false, nil
+	case "progress":
+		return false, c.cmdProgress(arch, rest)
 	default:
 		c.log.Warnf("未知命令: %s（输入 help 查看帮助）", args[0])
 		return false, nil
@@ -340,28 +349,87 @@ func (c *CLI) cmdNicoSearch(ctx context.Context, a *archiver.Archiver, args []st
 		listURL = nico.SearchURLFromKeyword(input)
 		c.log.Infof("用关键词「%s」构造搜索地址: %s", input, listURL)
 	}
-	page := 1
-	if len(args) >= 2 {
-		n, err := strconv.Atoi(args[1])
-		if err != nil || n <= 0 {
-			return fmt.Errorf("起始页必须是正整数: %s", args[1])
-		}
-		page = n
+	page, err := optionalPage(args, 1)
+	if err != nil {
+		return err
 	}
-	c.log.Stepf("开始搜索索引: %s（从第 %d 页开始）", listURL, page)
-	return a.ProcessList(ctx, listURL, page)
+	key, label := searchKeyAndLabel(input, listURL)
+	return c.runList(ctx, a, listURL, page, key, label)
 }
 
 func (c *CLI) cmdNicoAuthor(ctx context.Context, a *archiver.Archiver, args []string) error {
 	if len(args) < 1 {
-		return errors.New("用法: nico-author <作者主页URL>")
+		return errors.New("用法: nico-author <作者主页URL> [起始页]")
 	}
 	pageURL, id, err := nico.NormalizeUserURL(args[0])
 	if err != nil {
 		return err
 	}
-	c.log.Stepf("开始作者索引: %s（作者 ID %s）", pageURL, id)
-	return a.ProcessList(ctx, pageURL, 1)
+	page, err := optionalPage(args, 1)
+	if err != nil {
+		return err
+	}
+	return c.runList(ctx, a, pageURL, page, nico.AuthorProgressKey(id), "作者 "+id)
+}
+
+func (c *CLI) cmdNicoTag(ctx context.Context, a *archiver.Archiver, args []string) error {
+	if len(args) < 1 {
+		return errors.New("用法: nico-tag <tag|tag页面URL> [起始页]")
+	}
+	listURL, tag, err := nico.NormalizeTagURL(args[0])
+	if err != nil {
+		return err
+	}
+	page, err := optionalPage(args, 1)
+	if err != nil {
+		return err
+	}
+	return c.runList(ctx, a, listURL, page, nico.TagProgressKey(tag), "tag「"+tag+"」")
+}
+
+// optionalPage 解析可选的页码参数；未给出时返回 def（后续会与历史进度比较）。
+func optionalPage(args []string, def int) (int, error) {
+	if len(args) < 2 {
+		return def, nil
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(args[1]))
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("起始页必须是正整数: %s", args[1])
+	}
+	return n, nil
+}
+
+// runList 统一处理「显式页码 / 历史进度」并执行翻页下载。
+func (c *CLI) runList(ctx context.Context, a *archiver.Archiver, listURL string, page int, key, label string) error {
+	explicit := page > 1
+	if !explicit {
+		switch {
+		case a.Restart:
+			c.log.Infof("已忽略历史进度（--restart），从第 1 页开始")
+		default:
+			if e, ok := a.ResumePage(key); ok && e.LastPage > 0 {
+				note := ""
+				if e.Completed {
+					note = "，上次已翻到最后一页"
+				}
+				c.log.Infof("检测到历史进度 %s：上次停在第 %d 页%s，从该页继续（--restart 可从头开始）", key, e.LastPage, note)
+				page = e.LastPage
+			}
+		}
+	}
+	c.log.Stepf("开始%s索引: %s（从第 %d 页开始）", label, listURL, page)
+	return a.ProcessList(ctx, listURL, page, key, label)
+}
+
+// searchKeyAndLabel 从关键词或搜索 URL 中提取进度用的键与可读标签。
+func searchKeyAndLabel(input, listURL string) (string, string) {
+	if u, err := url.Parse(listURL); err == nil && strings.HasPrefix(u.Path, "/search/") {
+		kw, derr := url.PathUnescape(strings.TrimPrefix(u.Path, "/search/"))
+		if derr == nil && strings.TrimSpace(kw) != "" {
+			return nico.SearchProgressKey(kw), "搜索「" + kw + "」"
+		}
+	}
+	return nico.SearchProgressKey(input), "搜索「" + input + "」"
 }
 
 func (c *CLI) cmdNicoDown(ctx context.Context, a *archiver.Archiver, args []string) error {
@@ -395,6 +463,52 @@ func (c *CLI) cmdDown(ctx context.Context, a *archiver.Archiver, args []string) 
 	}
 	c.log.Infof("完成: %s (%s)", res.Path, util.HumanBytes(res.Bytes))
 	c.log.Infof("SHA256: %s", res.SHA256)
+	return nil
+}
+
+// cmdProgress 查看或清除索引下载进度。
+func (c *CLI) cmdProgress(a *archiver.Archiver, args []string) error {
+	if len(args) > 0 {
+		switch strings.ToLower(args[0]) {
+		case "clear", "reset":
+			if len(args) < 2 {
+				return errors.New("用法: progress clear <key|all>（progress 查看所有 key）")
+			}
+			target := args[1]
+			if strings.EqualFold(target, "all") || target == "*" {
+				if err := a.ClearProgress(""); err != nil {
+					return err
+				}
+				c.log.Infof("已清空全部下载进度")
+				return nil
+			}
+			if err := a.ClearProgress(target); err != nil {
+				return err
+			}
+			c.log.Infof("已清除进度: %s", target)
+			return nil
+		default:
+			return fmt.Errorf("未知 progress 子命令: %s（可用: progress [clear <key|all>]）", args[0])
+		}
+	}
+	entries := a.ProgressEntries()
+	fmt.Fprintln(c.out)
+	if len(entries) == 0 {
+		fmt.Fprintln(c.out, "还没有任何下载进度记录。")
+		fmt.Fprintf(c.out, "进度文件：%s\n\n", orDash(a.ProgressPath()))
+		return nil
+	}
+	fmt.Fprintf(c.out, "%-28s %8s  %-8s %s\n", "KEY", "页码", "状态", "更新时间")
+	for _, e := range entries {
+		st := "进行中"
+		if e.Completed {
+			st = "已完成"
+		}
+		fmt.Fprintf(c.out, "%-28s %8d  %-8s %s\n", e.Key, e.LastPage, st, e.UpdatedAt.Format("2006-01-02 15:04:05"))
+	}
+	fmt.Fprintf(c.out, "\n进度文件：%s\n", orDash(a.ProgressPath()))
+	fmt.Fprintln(c.out, "提示：未指定页码时会从记录的页码继续；progress clear <key> 可重置。")
+	fmt.Fprintln(c.out)
 	return nil
 }
 
@@ -669,17 +783,39 @@ func (c *CLI) showHelp(args []string) {
 nico-search <搜索页URL|关键词> [起始页]
   用 nico seiga 搜索页作为索引，一页页地处理投稿。
   - 只给关键词时会自动构造搜索地址。
+  - 不写起始页时，若有历史进度就从记录的页码继续（--restart 可从头开始）。
   - 若遇到需要登录的页面，请先在 cfg 中设置 nico_cookie。
   例：
     nico-search https://seiga.nicovideo.jp/search/ボイロ?target=illust 1
     nico-search ボイロ
 `)
+	case "nico-tag", "tag":
+		fmt.Fprint(c.out, `
+nico-tag <tag|tag页面URL> [起始页]
+  用 nico seiga 的 tag 页面作为索引批量下载。
+  - 只给 tag 名时会自动构造地址（也可直接贴 URL）。
+  - 不写起始页时，若有历史进度就从记录的页码继续（--restart 可从头开始）。
+  例：
+    nico-tag VOICEROID
+    nico-tag 立ち絵 3
+    nico-tag https://seiga.nicovideo.jp/tag/VOICEROID
+`)
 	case "nico-author", "author":
 		fmt.Fprint(c.out, `
-nico-author <作者主页URL>
+nico-author <作者主页URL> [起始页]
   用作者主页作为索引，翻完作者的所有投稿。
+  - 不写起始页时，若有历史进度就从记录的页码继续（--restart 可从头开始）。
   例：
     nico-author https://seiga.nicovideo.jp/user/illust/39911624
+`)
+	case "progress":
+		fmt.Fprint(c.out, `
+progress                    查看各索引（搜索 / tag / 作者）的下载进度
+progress clear <key>        清除某个索引的进度
+progress clear all          清除全部进度
+
+进度文件保存在配置目录下，每处理完一页就更新一次。
+未指定页码时，命令会从记录的页码继续下载（已下载过的文件会自动跳过）。
 `)
 	case "nico-down", "nico":
 		fmt.Fprint(c.out, `
@@ -723,14 +859,20 @@ cfg reset                  恢复默认配置
 		fmt.Fprintf(c.out, `
 可用命令：
   nico-search <url|关键词> [起始页]  用搜索页作为索引批量下载
-  nico-author <url>                 用作者主页作为索引批量下载
+  nico-tag <tag|url> [起始页]       用 tag 页面作为索引批量下载
+  nico-author <url> [起始页]        用作者主页作为索引批量下载
   nico-down <url>                   处理单个 nico 静画投稿
   down <url> [密码]                 直接下载一个 getuploader 链接
   cfg [show|set|path|test|reset]    配置（Cookie / 下载目录 / 代理等）
+  progress [clear <key|all>]        查看 / 清除索引下载进度
   probe                             检查 nico / getuploader 连通性
   stats                             显示本次会话的统计
   help [命令]                       查看详细帮助（help keys 查看快捷键）
   exit | quit                       退出
+
+页码与续传：
+  不写起始页时，如果该索引有历史进度，就从记录的页码继续下载；
+  想强制从头开始用 --restart，想重置记录用 progress clear <key>。
 
 Ctrl+C 的行为：
   - 任务运行中    取消当前任务，回到 archiver> 提示符
@@ -741,6 +883,7 @@ Ctrl+C 的行为：
 通用参数：
   --force / -f   即使文件已存在也重新下载
   --dry-run / -n 只扫描并报告将要下载的链接，不真正下载
+  --restart      忽略历史进度，从第 1 页开始
   --debug        输出调试日志（HTTP 请求等）
 
 下载文件会保存到：<下载目录>/<作者名>/<文件名>

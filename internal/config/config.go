@@ -80,6 +80,15 @@ func HistoryPath() (string, error) {
 	return filepath.Join(filepath.Dir(p), "history"), nil
 }
 
+// ProgressPath 返回索引下载进度文件路径（与配置文件同目录）。
+func ProgressPath() (string, error) {
+	p, err := Path()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(filepath.Dir(p), "progress.json"), nil
+}
+
 // Load 读取配置；文件不存在时返回默认配置。
 func Load() (*Config, string, error) {
 	path, err := Path()

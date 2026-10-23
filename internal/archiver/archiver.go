@@ -18,6 +18,7 @@ import (
 	"nico-seiga-archiver/internal/metadata"
 	"nico-seiga-archiver/internal/nico"
 	"nico-seiga-archiver/internal/proxy"
+	"nico-seiga-archiver/internal/state"
 	"nico-seiga-archiver/internal/util"
 )
 
@@ -54,8 +55,12 @@ type Archiver struct {
 	Force bool
 	// DryRun 为 true 时只扫描和报告，不真正下载。
 	DryRun bool
+	// Restart 为 true 时忽略历史进度，一律从第 1 页开始。
+	Restart bool
 
 	ProxyInfo proxy.Result
+
+	progress *state.Store
 
 	visited map[string]bool
 	stats   Stats
@@ -78,6 +83,12 @@ func New(cfg *config.Config, log *logx.Logger) (*Archiver, error) {
 	if err != nil {
 		return nil, err
 	}
+	progress, err := openProgress()
+	if err != nil {
+		// 进度只是锦上添花，坏了不该挡住下载。
+		log.Warnf("读取下载进度失败（将忽略历史页码）: %v", err)
+		progress, _ = state.Open("")
+	}
 	delay := cfg.Delay()
 	return &Archiver{
 		cfg:       cfg,
@@ -86,9 +97,18 @@ func New(cfg *config.Config, log *logx.Logger) (*Archiver, error) {
 		nico:      nico.New(hc, log, delay),
 		gu:        getuploader.New(hc, log, delay),
 		store:     store,
+		progress:  progress,
 		ProxyInfo: hc.ProxyInfo,
 		visited:   map[string]bool{},
 	}, nil
+}
+
+func openProgress() (*state.Store, error) {
+	path, err := config.ProgressPath()
+	if err != nil {
+		return nil, err
+	}
+	return state.Open(path)
 }
 
 // Stats 返回当前统计。
@@ -99,6 +119,41 @@ func (a *Archiver) ResetStats() { a.stats = Stats{} }
 
 // MetadataPath 返回元数据文件路径。
 func (a *Archiver) MetadataPath() string { return a.store.Path() }
+
+// ProgressPath 返回进度文件路径。
+func (a *Archiver) ProgressPath() string {
+	if a.progress == nil {
+		return ""
+	}
+	return a.progress.Path()
+}
+
+// ProgressEntries 返回所有索引的进度。
+func (a *Archiver) ProgressEntries() []state.Entry {
+	if a.progress == nil {
+		return nil
+	}
+	return a.progress.Entries()
+}
+
+// ResumePage 返回某个索引历史记录的页码。
+func (a *Archiver) ResumePage(key string) (state.Entry, bool) {
+	if a.progress == nil || key == "" {
+		return state.Entry{}, false
+	}
+	return a.progress.Get(key)
+}
+
+// ClearProgress 清除某个索引的进度（key 为空表示全部）。
+func (a *Archiver) ClearProgress(key string) error {
+	if a.progress == nil {
+		return nil
+	}
+	if key == "" {
+		return a.progress.ClearAll()
+	}
+	return a.progress.Clear(key)
+}
 
 func (a *Archiver) destDirFor(author string) string {
 	return filepath.Join(a.cfg.DownloadDir, util.SanitizeName(author))
@@ -254,8 +309,10 @@ func (a *Archiver) recordSuccess(ill *nico.Illust, guURL string, res *getuploade
 	}
 }
 
-// ProcessList 逐页处理列表页（搜索结果或作者主页）。
-func (a *Archiver) ProcessList(ctx context.Context, rawURL string, startPage int) error {
+// ProcessList 逐页处理列表页（搜索结果 / tag / 作者主页）。
+//
+// progressKey 非空时会把处理到的页码记录到进度文件，下次未指定页码即可续传。
+func (a *Archiver) ProcessList(ctx context.Context, rawURL string, startPage int, progressKey, label string) error {
 	current, err := nico.WithPage(rawURL, startPage)
 	if err != nil {
 		return err
@@ -264,6 +321,15 @@ func (a *Archiver) ProcessList(ctx context.Context, rawURL string, startPage int
 	if maxPages <= 0 {
 		maxPages = 500
 	}
+	record := func(page int, completed bool) {
+		if a.progress == nil || progressKey == "" {
+			return
+		}
+		if err := a.progress.Set(progressKey, label, page, completed); err != nil {
+			a.log.Debugf("记录下载进度失败: %v", err)
+		}
+	}
+	lastPage := startPage
 	for i := 0; i < maxPages; i++ {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -272,7 +338,9 @@ func (a *Archiver) ProcessList(ctx context.Context, rawURL string, startPage int
 		if err != nil {
 			return err
 		}
-		a.log.Stepf("列表第 %d 页: %s", nico.PageOf(current), current)
+		pageNo := nico.PageOf(current)
+		lastPage = pageNo
+		a.log.Stepf("列表第 %d 页: %s", pageNo, current)
 		if len(page.Items) == 0 {
 			a.log.Warnf("  本页没有解析到投稿，结束")
 			break
@@ -289,11 +357,17 @@ func (a *Archiver) ProcessList(ctx context.Context, rawURL string, startPage int
 				a.log.Errorf("处理投稿失败 %s: %v", item.URL, err)
 			}
 		}
+		// 每处理完一页就落盘，中断后也能接着来。
+		record(pageNo, false)
 		if page.NextURL == "" || page.NextURL == current {
 			a.log.Infof("  已到最后一页")
+			record(pageNo, true)
 			break
 		}
 		current = page.NextURL
+	}
+	if a.progress != nil && progressKey != "" {
+		a.log.Infof("进度已记录：%s → 第 %d 页（下次未指定页码时从这里继续）", progressKey, lastPage)
 	}
 	a.log.Infof("%s", a.stats.String())
 	return nil

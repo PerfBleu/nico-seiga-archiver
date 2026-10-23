@@ -113,6 +113,55 @@ func SearchURLFromKeyword(keyword string) string {
 	return u.String()
 }
 
+// reTagPath 匹配 /tag/<name> 或 tag/<name> 形式。
+var reTagPath = regexp.MustCompile(`(?i)(?:^|/)tag/([^/?#]+)`)
+
+// NormalizeTagURL 把「tag 名」「tag/xxx」「完整 tag 页面地址」统一成规范地址。
+// 返回值 tag 是解码后的 tag 名（例如 VOICEROID、立ち絵）。
+func NormalizeTagURL(input string) (pageURL, tag string, err error) {
+	raw := strings.TrimSpace(input)
+	if raw == "" {
+		return "", "", fmt.Errorf("tag 不能为空")
+	}
+	// 已经是完整 URL 或带 /tag/ 的路径。
+	if m := reTagPath.FindStringSubmatch(raw); m != nil {
+		name, derr := url.PathUnescape(m[1])
+		if derr != nil {
+			name = m[1]
+		}
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return "", "", fmt.Errorf("无法识别的 tag 地址: %s", input)
+		}
+		return "https://seiga.nicovideo.jp/tag/" + url.PathEscape(name), name, nil
+	}
+	if strings.Contains(raw, "://") {
+		return "", "", fmt.Errorf("不是 tag 页面地址: %s（应形如 https://seiga.nicovideo.jp/tag/VOICEROID）", input)
+	}
+	// 直接给 tag 名。
+	name := strings.TrimPrefix(raw, "#")
+	name = strings.TrimSpace(name)
+	// 用户可能粘贴了已经编码过的 tag。
+	if decoded, derr := url.PathUnescape(name); derr == nil {
+		name = decoded
+	}
+	if name == "" {
+		return "", "", fmt.Errorf("tag 不能为空")
+	}
+	return "https://seiga.nicovideo.jp/tag/" + url.PathEscape(name), name, nil
+}
+
+// TagProgressKey 返回 tag 索引用于记录进度的键。
+func TagProgressKey(tag string) string { return "tag:" + tag }
+
+// SearchProgressKey 返回搜索索引用于记录进度的键。
+func SearchProgressKey(keywordOrURL string) string {
+	return "search:" + strings.TrimSpace(keywordOrURL)
+}
+
+// AuthorProgressKey 返回作者索引用于记录进度的键。
+func AuthorProgressKey(userID string) string { return "author:" + userID }
+
 // WithPage 给 URL 设置 page 参数。
 func WithPage(rawURL string, page int) (string, error) {
 	u, err := url.Parse(strings.TrimSpace(rawURL))

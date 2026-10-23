@@ -12,12 +12,16 @@ getuploader网站即将停止运营，nico seiga上许多作者的立绘是存�
 
 每种不同的输入索引对应不同的命令行，目前可以分为以下几种：
 
-1. nico-search {string url} {int page}: 使用nico seiga (如https://seiga.nicovideo.jp/illust/?track=home) 的搜索框作为目录索引进行下载, 可以输入密码跳页， 默认情况下从指定页一直下载下去，没指定的话西欧哪个第一页开始。
+1. nico-search {string url} {int page}: 使用nico seiga (如https://seiga.nicovideo.jp/illust/?track=home) 的搜索框作为目录索引进行下载, 可以输入密码跳页， 默认情况下从指定页一直下载下去，没指定的话从第一页开始。
 2. nico-author {string url}: 输入一个作者主页地址（如https://seiga.nicovideo.jp/user/illust/39911624），作为索引目录进行下载
 3. nico-down {string url}： 输入一个nico seiga投稿页面（如https://seiga.nicovideo.jp/seiga/im11691748）下载
 4. down {string url} {string password}:  输入getuploader网页地址（如https://uu.getuploader.com/harinashi/download/71 密码2525）和密码进行下载
-5. cfg 进入设置各种所需令牌的页面， 输入的东西保存在一个json配置文件里
-6. 下载路径默认为当前cwd，也可以在cfg里指定
+5. nico-tag {string tag} {int page}： 使用nico seiga的tag（如 https://seiga.nicovideo.jp/tag/VOICEROID）作为目录索引进行下载, 可以输入密码跳页， 默认情况下从指定页一直下载下去，没指定的话从第一页开始。
+
+其他命令行和要求：
+1. cfg 进入设置各种所需令牌的页面， 输入的东西保存在一个json配置文件里
+2. 下载路径默认为当前cwd，也可以在cfg里指定
+3. 没有指定页码，且有历史记录的情况下，按照历史记录的页码开始下载
 
 ## 编写时
 如果有需要认证或者令牌的时候问我，我来提供
