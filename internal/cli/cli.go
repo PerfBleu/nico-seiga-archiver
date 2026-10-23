@@ -828,8 +828,10 @@ nico-down <静画投稿URL>
 		fmt.Fprint(c.out, `
 down <getuploader下载页URL> [密码]
   跳过 nico，直接下载一个 getuploader 链接。没有密码时会自动尝试。
+  - 密码先按原样提交；若失败且含有全角字符，会自动转成半角再试一次。
   例：
     down https://uu.getuploader.com/harinashi/download/71 2525
+    down https://uu.getuploader.com/harinashi/download/71 ２５２５
 `)
 	case "cfg", "config":
 		fmt.Fprint(c.out, `
@@ -873,6 +875,11 @@ cfg reset                  恢复默认配置
 页码与续传：
   不写起始页时，如果该索引有历史进度，就从记录的页码继续下载；
   想强制从头开始用 --restart，想重置记录用 progress clear <key>。
+
+密码处理：
+  密码保留作者原本的写法（全角「２５２５」与半角「2525」并不等价）。
+  先按原样提交；若认证失败且密码含全角字符，会自动转成半角再试一次；
+  仍然失败才询问你手动输入。
 
 Ctrl+C 的行为：
   - 任务运行中    取消当前任务，回到 archiver> 提示符

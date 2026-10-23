@@ -36,10 +36,34 @@ func TestLinks(t *testing.T) {
 			wantN:   1,
 		},
 		{
-			name:    "full width",
+			name:    "full width kept as-is",
 			text:    "https://uu.getuploader.com/harinashi/download/9\nｐａｓｓ：２５２５",
 			wantURL: "https://uu.getuploader.com/harinashi/download/9",
-			wantPW:  "2525",
+			wantPW:  "２５２５",
+			wantSrc: "keyword",
+			wantN:   1,
+		},
+		{
+			name:    "full width digits after url",
+			text:    "配布先 https://uu.getuploader.com/harinashi/download/31 ２５２５",
+			wantURL: "https://uu.getuploader.com/harinashi/download/31",
+			wantPW:  "２５２５",
+			wantSrc: "after-url",
+			wantN:   1,
+		},
+		{
+			name:    "full width bracket",
+			text:    "https://uu.getuploader.com/harinashi/download/32（９９９９）",
+			wantURL: "https://uu.getuploader.com/harinashi/download/32",
+			wantPW:  "９９９９",
+			wantSrc: "bracket",
+			wantN:   1,
+		},
+		{
+			name:    "full width keyword and digits",
+			text:    "https://uu.getuploader.com/harinashi/download/33\nパスワード：６３０１２",
+			wantURL: "https://uu.getuploader.com/harinashi/download/33",
+			wantPW:  "６３０１２",
 			wantSrc: "keyword",
 			wantN:   1,
 		},
@@ -114,5 +138,68 @@ func TestNormalizeURL(t *testing.T) {
 		if u, ok := NormalizeURL(s); ok {
 			t.Errorf("NormalizeURL(%q) = %q, want not ok", s, u)
 		}
+	}
+}
+
+func TestPasswordAlternates(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want []string
+	}{
+		{"empty", "", nil},
+		{"half width only", "2525", []string{"2525"}},
+		{"full width first", "２５２５", []string{"２５２５", "2525"}},
+		{"full width alnum", "ＡＢＣ１２３", []string{"ＡＢＣ１２３", "ABC123"}},
+		{"full width mixed", "２５A", []string{"２５A", "25A"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := PasswordAlternates(tc.in)
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("got %v, want %v", got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+func TestLinkAlternates(t *testing.T) {
+	links := Links("https://uu.getuploader.com/harinashi/download/9\nパスワード：２５２５")
+	if len(links) != 1 {
+		t.Fatalf("got %d links", len(links))
+	}
+	// 全角密码优先，其次半角。
+	got := links[0].Alternates()
+	if len(got) != 2 || got[0] != "２５２５" || got[1] != "2525" {
+		t.Errorf("Alternates = %v", got)
+	}
+}
+
+func TestHalfWidthKeepsOrder(t *testing.T) {
+	if got := ToHalfWidth("２５２５"); got != "2525" {
+		t.Errorf("ToHalfWidth = %q", got)
+	}
+	if got := ToHalfWidth("パスワード"); got != "パスワード" {
+		t.Errorf("片假名不应被转换: %q", got)
+	}
+}
+
+// URL 里出现全角字符时，仍应能正确识别（宽度只用于匹配，不改写原文）。
+func TestLinksWithFullWidthContext(t *testing.T) {
+	text := "配布場所：https://uu.getuploader.com/harinashi/download/71\nパスワード：２５２５\n※全角です"
+	links := Links(text)
+	if len(links) != 1 {
+		t.Fatalf("got %d links: %+v", len(links), links)
+	}
+	if links[0].URL != "https://uu.getuploader.com/harinashi/download/71" {
+		t.Errorf("url = %q", links[0].URL)
+	}
+	if links[0].Password != "２５２５" {
+		t.Errorf("password = %q, want ２５２５", links[0].Password)
 	}
 }

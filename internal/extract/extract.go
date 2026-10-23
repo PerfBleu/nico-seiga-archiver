@@ -1,9 +1,13 @@
 // Package extract 从简介文本中提取 getuploader 链接和密码。
+//
+// 注意：作者有时会用全角字符写密码（如「２５２５」），此时「２５２５」才是真密码，
+// 转成半角反而会错。因此这里的密码一律保留原文宽度，交给调用方在失败后再尝试半角版本。
 package extract
 
 import (
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"nico-seiga-archiver/internal/util"
 )
@@ -16,6 +20,25 @@ type Link struct {
 	PasswordSource string
 	// Context 是链接附近的原始文本片段，便于日志与人工核对。
 	Context string
+}
+
+// Alternates 返回依次尝试的密码候选：先原文（可能是全角），再半角版本。
+// 两者相同时只返回一个。
+func (l Link) Alternates() []string {
+	return PasswordAlternates(l.Password)
+}
+
+// PasswordAlternates 返回密码的尝试顺序：原始写法优先，其次半角转换。
+func PasswordAlternates(p string) []string {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return nil
+	}
+	out := []string{p}
+	if hw := ToHalfWidth(p); hw != p {
+		out = append(out, hw)
+	}
+	return out
 }
 
 var (
@@ -31,22 +54,50 @@ var (
 	// URL 后面紧跟的括号内容，例如「…/71（2525）」
 	reBracket = regexp.MustCompile(`^\s*[【\[（(「『]\s*([A-Za-z0-9!@#$%^&*_\-\.]{2,24})\s*[】\]）)」』]`)
 
+	// 前置文本里的裸数字密码，例如「2525 https://...」
+	reBareDigits = regexp.MustCompile(`(?:^|[\s\x{3000}、,，/／|｜:：=＝【\[（(「『])(\d{3,8})(?:$|[\s\x{3000}、,，/／|｜】\]）)」』])`)
+
 	reTrailing = `.,;:!?'"”’、。，；：！？】」』）)]}`
 )
+
+// view 是一个文本的两种视图：原文（保留全角）与宽度归一化（全角转半角）。
+// 两者 rune 数量始终相同，因此同一 rune 下标可以互相映射。
+type view struct {
+	orig []rune
+	norm []rune
+}
+
+func newView(s string) view {
+	orig := []rune(s)
+	norm := make([]rune, len(orig))
+	for i, r := range orig {
+		norm[i] = toHalfWidthRune(r)
+	}
+	return view{orig: orig, norm: norm}
+}
 
 // Links 从文本中提取所有 getuploader 下载页链接。
 // 同一个 URL 只保留第一次出现的密码信息。
 func Links(text string) []Link {
-	text = normalizeWidth(text)
-	matches := reURL.FindAllStringIndex(text, -1)
+	v := newView(text)
+	normText := string(v.norm)
+
+	matches := reURL.FindAllStringIndex(normText, -1)
 	if len(matches) == 0 {
 		return nil
+	}
+	// 把字节下标换成 rune 下标，方便和原文对齐。
+	idx := runeIndexMap(normText)
+	var runeMatches [][2]int
+	for _, m := range matches {
+		runeMatches = append(runeMatches, [2]int{idx[m[0]], idx[m[1]]})
 	}
 
 	var out []Link
 	seen := map[string]bool{}
-	for i, m := range matches {
-		raw := text[m[0]:m[1]]
+	for i, m := range runeMatches {
+		// URL 本身取归一化视图，这样全角写法的链接也能识别。
+		raw := string(v.norm[m[0]:m[1]])
 		raw = strings.TrimRight(raw, reTrailing+"…")
 		normalized, ok := NormalizeURL(raw)
 		if !ok || seen[normalized] {
@@ -60,25 +111,24 @@ func Links(text string) []Link {
 			start = 0
 		}
 		if i > 0 {
-			if prev := matches[i-1][1]; prev > start {
+			if prev := runeMatches[i-1][1]; prev > start {
 				start = prev
 			}
 		}
 		end := m[1] + 300
-		if end > len(text) {
-			end = len(text)
+		if end > len(v.orig) {
+			end = len(v.orig)
 		}
-		if i+1 < len(matches) && matches[i+1][0] < end {
-			end = matches[i+1][0]
+		if i+1 < len(runeMatches) && runeMatches[i+1][0] < end {
+			end = runeMatches[i+1][0]
 		}
-		seg := text[start:end]
 
-		pw, source := passwordInSegment(seg, m[1]-start)
+		pw, source := passwordInSegment(v.orig[start:end], v.norm[start:end], m[1]-start)
 		out = append(out, Link{
 			URL:            normalized,
 			Password:       pw,
 			PasswordSource: source,
-			Context:        util.OneLine(seg),
+			Context:        util.OneLine(string(v.orig[start:end])),
 		})
 	}
 	return out
@@ -108,108 +158,147 @@ func NormalizeURL(raw string) (string, bool) {
 	return raw, true
 }
 
-func passwordInSegment(seg string, urlEnd int) (string, string) {
-	if urlEnd > len(seg) {
-		urlEnd = len(seg)
+// passwordInSegment 在 [orig, norm] 两个等长视图里找密码。
+// urlEnd 是 URL 结束位置在该片段内的 rune 下标。
+func passwordInSegment(orig, norm []rune, urlEnd int) (string, string) {
+	if urlEnd < 0 {
+		urlEnd = 0
 	}
-	after := seg[urlEnd:]
-	before := seg[:urlEnd]
-	if urlEnd > 240 {
-		before = before[urlEnd-240:]
+	if urlEnd > len(orig) {
+		urlEnd = len(orig)
+	}
+	afterO, afterN := orig[urlEnd:], norm[urlEnd:]
+	beforeO, beforeN := orig[:urlEnd], norm[:urlEnd]
+	if len(beforeO) > 240 {
+		beforeO = beforeO[len(beforeO)-240:]
+		beforeN = beforeN[len(beforeN)-240:]
 	}
 
 	// 1) 优先看 URL 之后（同一段内）的密码，避免把上一个链接的密码误用。
-	if m := rePassKeyword.FindStringSubmatch(after); m != nil {
-		if pw := cleanPassword(m[1]); pw != "" {
-			return pw, "keyword"
-		}
+	if pw := matchPassword(afterO, afterN, rePassKeyword, 1); pw != "" {
+		return pw, "keyword"
 	}
 	// 2) URL 紧跟括号内容。
-	if m := reBracket.FindStringSubmatch(after); m != nil {
-		if pw := cleanPassword(m[1]); pw != "" {
-			return pw, "bracket"
-		}
+	if pw := matchPassword(afterO, afterN, reBracket, 1); pw != "" {
+		return pw, "bracket"
 	}
 	// 3) URL 后面同一行的数字/字母。
-	line := after
-	if idx := strings.IndexAny(line, "\n"); idx >= 0 {
-		line = line[:idx]
-	}
-	if m := reAfterURLDigits.FindStringSubmatch(line); m != nil {
-		if pw := cleanPassword(m[1]); pw != "" {
+	if nl := indexRune(afterN, '\n'); nl >= 0 {
+		lineO, lineN := afterO[:nl], afterN[:nl]
+		if pw := matchPassword(lineO, lineN, reAfterURLDigits, 1); pw != "" {
 			return pw, "after-url"
 		}
+	} else if pw := matchPassword(afterO, afterN, reAfterURLDigits, 1); pw != "" {
+		return pw, "after-url"
 	}
 	// 4) 再看看 URL 前面的最后一段文字。
-	if urlEnd > 240 {
-		before = seg[urlEnd-240 : urlEnd]
-	}
-	if m := rePassKeyword.FindStringSubmatch(before); m != nil {
-		if pw := cleanPassword(m[1]); pw != "" {
-			return pw, "keyword-before"
-		}
+	if pw := matchPassword(beforeO, beforeN, rePassKeyword, 1); pw != "" {
+		return pw, "keyword-before"
 	}
 	// 5) 前置文本里找「4 位数字」这种最常见的手写密码。
-	if pw := findBareDigits(before); pw != "" {
+	tailO, tailN := beforeO, beforeN
+	if len(tailO) > 120 {
+		tailO = tailO[len(tailO)-120:]
+		tailN = tailN[len(tailN)-120:]
+	}
+	if pw := matchPassword(tailO, tailN, reBareDigits, 1); pw != "" {
 		return pw, "digits"
 	}
 	return "", ""
 }
 
-func findBareDigits(s string) string {
-	// 只从 URL 前面的最后 120 个字符里找，降低误判。
-	if len(s) > 120 {
-		s = s[len(s)-120:]
-	}
-	re := regexp.MustCompile(`(?:^|[\s\x{3000}、,，/／|｜:：=＝【\[（(「『])(\d{3,8})(?:$|[\s\x{3000}、,，/／|｜】\]）)」』])`)
-	m := re.FindStringSubmatch(s)
-	if m == nil {
+// matchPassword 在归一化文本上匹配，再按同样的 rune 下标从原文里取出密码，
+// 从而保留全角写法（如「２５２５」）。
+func matchPassword(orig, norm []rune, re *regexp.Regexp, group int) string {
+	if len(norm) == 0 {
 		return ""
 	}
-	return m[1]
+	s := string(norm)
+	loc := re.FindStringSubmatchIndex(s)
+	if loc == nil {
+		return ""
+	}
+	gi := group * 2
+	if gi+1 >= len(loc) || loc[gi] < 0 || loc[gi+1] < 0 {
+		return ""
+	}
+	gs := utf8.RuneCountInString(s[:loc[gi]])
+	ge := utf8.RuneCountInString(s[:loc[gi+1]])
+	if gs < 0 || ge > len(orig) || gs >= ge {
+		return ""
+	}
+	rawPW := string(orig[gs:ge])
+	normPW := string(norm[gs:ge])
+	return cleanPassword(rawPW, normPW)
 }
 
-func cleanPassword(s string) string {
-	s = strings.TrimSpace(s)
-	s = strings.Trim(s, `"'“”‘’`)
-	s = strings.TrimRight(s, reTrailing)
-	s = strings.TrimSpace(s)
-	if s == "" {
+// cleanPassword 清理候选密码；raw 保留原始宽度，norm 仅用于关键词排除等判断。
+func cleanPassword(raw, norm string) string {
+	raw = strings.TrimSpace(raw)
+	raw = strings.Trim(raw, `"'“”‘’`)
+	raw = strings.TrimRight(raw, reTrailing)
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
 		return ""
 	}
-	lower := strings.ToLower(s)
+	lower := strings.ToLower(strings.TrimSpace(norm))
 	switch lower {
 	case "pass", "password", "url", "getuploader", "download", "http", "https", "zip", "rar", "7z":
 		return ""
 	}
 	// 纯字母且长度 <= 3 的，多半是误提取（如「pass」的残留）。
-	if len(s) <= 2 {
+	if utf8.RuneCountInString(raw) <= 2 {
 		return ""
 	}
-	return s
+	return raw
 }
 
-// normalizeWidth 把全角英文/数字/常见符号转成半角，长度保持不变（便于下标对应）。
-func normalizeWidth(s string) string {
+// ToHalfWidth 把全角英文/数字/常见符号转成半角。
+func ToHalfWidth(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
 	for _, r := range s {
-		switch {
-		case r >= '０' && r <= '９':
-			b.WriteRune('0' + (r - '０'))
-		case r >= 'Ａ' && r <= 'Ｚ':
-			b.WriteRune('A' + (r - 'Ａ'))
-		case r >= 'ａ' && r <= 'ｚ':
-			b.WriteRune('a' + (r - 'ａ'))
-		case r == '：':
-			b.WriteRune(':')
-		case r == '＝':
-			b.WriteRune('=')
-		case r == '　':
-			b.WriteRune(' ')
-		default:
-			b.WriteRune(r)
-		}
+		b.WriteRune(toHalfWidthRune(r))
 	}
 	return b.String()
+}
+
+func toHalfWidthRune(r rune) rune {
+	switch {
+	case r >= '０' && r <= '９':
+		return '0' + (r - '０')
+	case r >= 'Ａ' && r <= 'Ｚ':
+		return 'A' + (r - 'Ａ')
+	case r >= 'ａ' && r <= 'ｚ':
+		return 'a' + (r - 'ａ')
+	case r == '：':
+		return ':'
+	case r == '＝':
+		return '='
+	case r == '　':
+		return ' '
+	default:
+		return r
+	}
+}
+
+// runeIndexMap 返回 字节下标 -> rune 下标 的映射表（长度 len(s)+1）。
+func runeIndexMap(s string) []int {
+	idx := make([]int, len(s)+1)
+	ri := 0
+	for bi := range s {
+		idx[bi] = ri
+		ri++
+	}
+	idx[len(s)] = ri
+	return idx
+}
+
+func indexRune(rs []rune, target rune) int {
+	for i, r := range rs {
+		if r == target {
+			return i
+		}
+	}
+	return -1
 }

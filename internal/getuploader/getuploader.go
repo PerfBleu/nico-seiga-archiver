@@ -510,10 +510,11 @@ func orDefault(s, def string) string {
 }
 
 func maskPassword(p string) string {
-	if len(p) <= 2 {
-		return strings.Repeat("*", len(p))
+	rs := []rune(p)
+	if len(rs) <= 2 {
+		return strings.Repeat("*", len(rs))
 	}
-	return p[:1] + strings.Repeat("*", len(p)-2) + p[len(p)-1:]
+	return string(rs[0]) + strings.Repeat("*", len(rs)-2) + string(rs[len(rs)-1])
 }
 
 func (c *Client) logInfof(format string, args ...any) {
