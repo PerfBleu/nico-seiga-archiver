@@ -33,6 +33,8 @@ type Config struct {
 	AskPassword bool `json:"ask_password"`
 	// MetadataFile 元数据文件名（相对 DownloadDir，或绝对路径）。
 	MetadataFile string `json:"metadata_file"`
+	// LogFile 日志文件路径（相对 DownloadDir，或绝对路径）；为空表示不写日志文件。
+	LogFile string `json:"log_file"`
 	// LogLevel debug/info/warn/error
 	LogLevel string `json:"log_level"`
 	// MaxPages 单次批量任务最多翻多少页（防止死循环）。
@@ -53,6 +55,7 @@ func Default() *Config {
 		TimeoutSec:   60,
 		AskPassword:  true,
 		MetadataFile: "metadata.json",
+		LogFile:      filepath.Join("logs", "archiver.log"),
 		LogLevel:     "info",
 		MaxPages:     500,
 	}
@@ -170,6 +173,19 @@ func (c *Config) MetadataPath() string {
 		return c.MetadataFile
 	}
 	return filepath.Join(c.DownloadDir, c.MetadataFile)
+}
+
+// LogPath 返回日志文件绝对路径；未启用时为空字符串。
+func (c *Config) LogPath() string {
+	p := strings.TrimSpace(c.LogFile)
+	if p == "" || strings.EqualFold(p, "none") || strings.EqualFold(p, "off") {
+		return ""
+	}
+	p = expandHome(p)
+	if filepath.IsAbs(p) {
+		return p
+	}
+	return filepath.Join(c.DownloadDir, p)
 }
 
 // Timeout 返回请求超时。

@@ -68,7 +68,21 @@ func New() (*CLI, error) {
 		_ = pr.LoadHistory(hp)
 	}
 	pr.SetCompleter(completeCommand)
+	// 尽早启用日志文件，启动阶段的问题也能留下记录。
+	c.attachLogFile()
 	return c, nil
+}
+
+// attachLogFile 按配置打开日志文件；失败只警告，不影响主流程。
+func (c *CLI) attachLogFile() {
+	path := c.cfg.LogPath()
+	if path == "" {
+		c.log.DetachFile()
+		return
+	}
+	if err := c.log.AttachFile(path); err != nil {
+		c.log.Warnf("日志文件不可用（%v），将只输出到终端", err)
+	}
 }
 
 // Run 启动 REPL；args 非空时以非交互方式执行一条命令后退出。
@@ -76,6 +90,7 @@ func (c *CLI) Run(args []string) int {
 	defer func() {
 		c.saveHistory()
 		c.pr.Close()
+		c.log.Close()
 	}()
 
 	if len(args) > 0 {
@@ -247,6 +262,9 @@ func (c *CLI) printBanner() {
 	fmt.Fprintf(c.out, "  配置文件  : %s\n", orDash(c.cfgPath))
 	fmt.Fprintf(c.out, "  下载目录  : %s\n", c.cfg.DownloadDir)
 	fmt.Fprintf(c.out, "  元数据    : %s\n", c.cfg.MetadataPath())
+	if lp := c.cfg.LogPath(); lp != "" {
+		fmt.Fprintf(c.out, "  日志      : %s\n", lp)
+	}
 	pr := proxy.Resolve(c.cfg.Proxy)
 	if pr.URL == "" {
 		fmt.Fprintf(c.out, "  代理      : 直连 (%s)\n", pr.Source)
@@ -696,6 +714,15 @@ func (c *CLI) cfgAskAll() error {
 	if ask != "" {
 		c.cfg.AskPassword = strings.EqualFold(ask, "y") || strings.EqualFold(ask, "yes") || ask == "是"
 	}
+	var logPath string
+	c.askInto("日志文件（相对下载目录或绝对路径，none=关闭；当前 "+orOff(c.cfg.LogFile)+"）", &logPath, nil)
+	if logPath != "" {
+		if strings.EqualFold(logPath, "none") || strings.EqualFold(logPath, "off") {
+			c.cfg.LogFile = ""
+		} else {
+			c.cfg.LogFile = logPath
+		}
+	}
 	return c.askInto("日志级别 (debug/info/warn/error)", &c.cfg.LogLevel, nil)
 }
 
@@ -730,9 +757,7 @@ func (c *CLI) cfgSet(key, value string) error {
 			return fmt.Errorf("max_pages 需要正整数: %s", value)
 		}
 		c.cfg.MaxPages = n
-	case "metadata", "metadata_file":
-		c.cfg.MetadataFile = value
-	case "log", "log_level":
+	case "log_level", "level":
 		lv := strings.ToLower(value)
 		switch lv {
 		case "debug", "info", "warn", "error":
@@ -740,6 +765,15 @@ func (c *CLI) cfgSet(key, value string) error {
 		default:
 			return fmt.Errorf("日志级别只能是 debug/info/warn/error")
 		}
+	case "log", "log_file", "logfile":
+		switch strings.ToLower(value) {
+		case "", "none", "off", "false", "no":
+			c.cfg.LogFile = ""
+		default:
+			c.cfg.LogFile = value
+		}
+	case "metadata", "metadata_file":
+		c.cfg.MetadataFile = value
 	default:
 		return fmt.Errorf("未知配置键: %s", key)
 	}
@@ -754,6 +788,7 @@ func (c *CLI) saveConfig() error {
 	}
 	c.cfgPath = path
 	c.rebuild()
+	c.attachLogFile()
 	c.log.Infof("配置已保存: %s", path)
 	return nil
 }
@@ -763,6 +798,7 @@ func (c *CLI) showConfig() {
 	fmt.Fprintf(c.out, "配置文件      : %s\n", orDash(c.cfgPath))
 	fmt.Fprintf(c.out, "download_dir  : %s\n", c.cfg.DownloadDir)
 	fmt.Fprintf(c.out, "metadata_file : %s（绝对路径: %s）\n", c.cfg.MetadataFile, c.cfg.MetadataPath())
+	fmt.Fprintf(c.out, "log_file      : %s（绝对路径: %s）\n", orOff(c.cfg.LogFile), orDash(c.cfg.LogPath()))
 	fmt.Fprintf(c.out, "proxy         : %s\n", c.cfg.Proxy)
 	pr := proxy.Resolve(c.cfg.Proxy)
 	if pr.URL == "" {
@@ -905,6 +941,10 @@ cfg reset                  恢复默认配置
   help [命令]                       查看详细帮助（help keys 查看快捷键）
   exit | quit                       退出
 
+删除线链接：
+  简介里被删除线划掉的链接（<s>/<del>/<strike>、style 含 line-through、~~文本~~）
+  会自动跳过，只使用没划线的链接；跳过记录会写进日志。
+
 命令行模式（不进 REPL，执行完就退出）：
   archiver <命令> [参数...]         例如 archiver nico-tag VOICEROID 2
   archiver <URL>                    直接粘贴链接，自动识别功能
@@ -941,9 +981,10 @@ Ctrl+C 的行为：
 下载文件会保存到：<下载目录>/<作者名>/<文件名>
 元数据（nico 地址、标题、作者、getuploader 地址、文件名、路径、MD5、SHA256）
 会写入：%s
+日志会追加写入：%s（可用 cfg set log none 关闭）
 
 提示：nico seiga 需要日本代理；本工具默认读取系统代理（cfg set proxy auto）。
-`, c.cfg.MetadataPath())
+`, c.cfg.MetadataPath(), orDash(c.cfg.LogPath()))
 	}
 	fmt.Fprintln(c.out)
 }
@@ -966,6 +1007,13 @@ func parseLevel(s string) logx.Level {
 func orDash(s string) string {
 	if strings.TrimSpace(s) == "" {
 		return "-"
+	}
+	return s
+}
+
+func orOff(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "off"
 	}
 	return s
 }

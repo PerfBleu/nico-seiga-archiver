@@ -25,6 +25,9 @@ type options struct {
 	delay     int
 	timeout   int
 	userAgent string
+	// logFile 覆盖日志文件路径；noLog 表示本次运行不写日志文件。
+	logFile string
+	noLog   bool
 
 	// 其余参数（命令 + 命令参数）。
 	argv []string
@@ -39,6 +42,7 @@ var valueFlags = map[string]string{
 	"--delay":   "delay",
 	"--timeout": "timeout",
 	"--ua":      "ua", "--user-agent": "ua",
+	"--log": "log", "--log-file": "log",
 }
 
 // parseOptions 扫描全部参数，提取全局 flag；不在列表里的原样保留为命令参数。
@@ -75,6 +79,10 @@ func parseOptions(argv []string) (options, error) {
 			continue
 		case "-q", "--quiet", "--silent":
 			o.quiet = true
+			i++
+			continue
+		case "--no-log", "--no-logfile":
+			o.noLog = true
 			i++
 			continue
 		case "--debug", "--verbose":
@@ -115,6 +123,8 @@ func parseOptions(argv []string) (options, error) {
 			o.cookie = value
 		case "ua":
 			o.userAgent = value
+		case "log":
+			o.logFile = value
 		case "config":
 			// 配置文件路径由 main 在启动前处理；这里接受但忽略，便于统一写法。
 		case "delay":
@@ -153,6 +163,14 @@ func (o options) apply(c *CLI) bool {
 		c.cfg.UserAgent = o.userAgent
 		changed = true
 	}
+	if o.noLog {
+		c.cfg.LogFile = ""
+		changed = true
+	}
+	if o.logFile != "" {
+		c.cfg.LogFile = util.ExpandHome(o.logFile)
+		changed = true
+	}
 	if o.delay > 0 {
 		c.cfg.DelayMS = o.delay - 1
 		changed = true
@@ -170,6 +188,7 @@ func (o options) apply(c *CLI) bool {
 	if changed || o.debug || o.quiet {
 		c.cfg.Normalize()
 		c.rebuild()
+		c.attachLogFile()
 	}
 	return changed
 }
@@ -271,6 +290,8 @@ func (c *CLI) printUsage() {
       --delay <毫秒>     覆盖请求间隔
       --timeout <秒>     覆盖请求超时
       --ua <值>          覆盖 User-Agent
+      --log <路径>       指定日志文件（相对下载目录或绝对路径）
+      --no-log           本次运行不写日志文件
   -f, --force            即使文件已存在也重新下载
   -n, --dry-run          只扫描并报告，不真正下载
       --restart          忽略历史进度，从第 1 页开始
@@ -282,6 +303,7 @@ func (c *CLI) printUsage() {
   配置文件  : %s
   下载目录  : %s
   代理      : %s (%s)
+  日志文件  : %s
 
 退出码：
   0 成功   1 出错   2 参数错误   130 用户取消（Ctrl+C）
@@ -293,7 +315,7 @@ func (c *CLI) printUsage() {
   archiver down https://uu.getuploader.com/harinashi/download/71 2525
   archiver nico-tag 立ち絵 -d ~/seiga --proxy http://127.0.0.1:7897
 
-`, version, orDash(c.cfgPath), c.cfg.DownloadDir, orDash(pr.URL), pr.Source)
+`, version, orDash(c.cfgPath), c.cfg.DownloadDir, orDash(pr.URL), pr.Source, orDash(c.cfg.LogPath()))
 	fmt.Fprintln(c.out)
 }
 

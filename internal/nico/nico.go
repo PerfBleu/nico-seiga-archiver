@@ -17,6 +17,7 @@ import (
 
 	"golang.org/x/net/html"
 
+	"nico-seiga-archiver/internal/extract"
 	"nico-seiga-archiver/internal/htmlx"
 	"nico-seiga-archiver/internal/httpclient"
 	"nico-seiga-archiver/internal/logx"
@@ -494,13 +495,54 @@ func pageDescription(doc *html.Node) string {
 	}
 	best := ""
 	for _, n := range cands {
-		t := htmlx.Text(n)
-		t = strings.TrimSpace(t)
+		t := strings.TrimSpace(textSkippingStruck(n))
 		if len([]rune(t)) > len([]rune(best)) {
 			best = t
 		}
 	}
 	return best
+}
+
+// textSkippingStruck 取节点文本，但整段跳过被删除线标记的子元素
+// （<s> <del> <strike> 或 style 含 line-through）。
+func textSkippingStruck(n *html.Node) string {
+	var b strings.Builder
+	var walk func(*html.Node)
+	walk = func(node *html.Node) {
+		if isStruckNode(node) {
+			return
+		}
+		if node.Type == html.TextNode {
+			b.WriteString(node.Data)
+			return
+		}
+		if node.Type == html.ElementNode {
+			switch strings.ToLower(node.Data) {
+			case "br":
+				b.WriteString("\n")
+				return
+			case "script", "style", "noscript":
+				return
+			}
+		}
+		for c := node.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(n)
+	return b.String()
+}
+
+func isStruckNode(n *html.Node) bool {
+	if n == nil || n.Type != html.ElementNode {
+		return false
+	}
+	switch strings.ToLower(n.Data) {
+	case "s", "del", "strike", "strikethrough":
+		return true
+	}
+	style := strings.ToLower(htmlx.Attr(n, "style"))
+	return strings.Contains(style, "line-through")
 }
 
 // ---------- HTTP 辅助 ----------
@@ -618,6 +660,7 @@ func (c *Client) fetchIllustAPI(ctx context.Context, id string) (*illustAPIRespo
 func normalizeDescription(s string) string {
 	s = strings.ReplaceAll(s, "\r\n", "\n")
 	s = strings.ReplaceAll(s, "\r", "\n")
+	s = markStrikethrough(s)
 	extra := anchorGetuploaderLinks(s)
 	s = stripHTML(s)
 	if len(extra) > 0 {
@@ -626,15 +669,40 @@ func normalizeDescription(s string) string {
 	return strings.TrimSpace(s)
 }
 
+// 删除线哨兵：与 internal/extract 约定一致。
+const (
+	strikeMarkOpen  = "\x01"
+	strikeMarkClose = "\x02"
+)
+
+var (
+	reStrikeOpenTag   = regexp.MustCompile(`(?i)<\s*(?:s|del|strike|strikethrough)\b[^>]*>`)
+	reStrikeCloseTag  = regexp.MustCompile(`(?i)<\s*/\s*(?:s|del|strike|strikethrough)\s*>`)
+	reAnyHTMLTag      = regexp.MustCompile(`(?i)<\s*(/?)\s*[a-z0-9]+\b[^>]*>`)
+	reStrikeMarkCheck = regexp.MustCompile(`[\x01\x02]`)
+)
+
+// markStrikethrough 把简介里的删除线统一成哨兵字符，交由 extract 判断哪些链接要跳过。
+//
+// 支持的写法见 extract.MaskStrike：<s>/<del>/<strike>、style 含 line-through、
+// ~~文本~~、Unicode 组合删除线。标签不配对时不做标记，避免误伤整段文字。
+func markStrikethrough(s string) string {
+	return extract.MaskStrike(s)
+}
+
 var reAnchorHref = regexp.MustCompile(`(?i)<a\b[^>]*?href\s*=\s*["']([^"']+)["']`)
 
 // anchorGetuploaderLinks 把简介中 <a href="...">文字</a> 的目标地址也提取出来，
 // 以防链接地址藏在属性里（正文只写了「こちら」之类）。
+// 被删除线划掉的 <a> 会被跳过。
 func anchorGetuploaderLinks(s string) []string {
 	var out []string
 	seen := map[string]bool{}
-	for _, m := range reAnchorHref.FindAllStringSubmatch(s, -1) {
-		u := html.UnescapeString(strings.TrimSpace(m[1]))
+	for _, loc := range reAnchorHref.FindAllStringSubmatchIndex(s, -1) {
+		if loc[2] < 0 || loc[3] < 0 {
+			continue
+		}
+		u := html.UnescapeString(strings.TrimSpace(s[loc[2]:loc[3]]))
 		if u == "" || seen[u] {
 			continue
 		}
@@ -642,9 +710,36 @@ func anchorGetuploaderLinks(s string) []string {
 			continue
 		}
 		seen[u] = true
+		if struckAt(s, loc[0]) {
+			// 被划掉的链接也保留下来（包上哨兵），让下游能记录「因删除线跳过」。
+			out = append(out, strikeMarkOpen+u+strikeMarkClose)
+			continue
+		}
 		out = append(out, u)
 	}
 	return out
+}
+
+// struckAt 判断位置 pos（字节下标）是否处于删除线哨兵之间。
+func struckAt(s string, pos int) bool {
+	if pos <= 0 {
+		return false
+	}
+	if pos > len(s) {
+		pos = len(s)
+	}
+	depth := 0
+	for i := 0; i < pos; i++ {
+		switch s[i] {
+		case strikeMarkOpen[0]:
+			depth++
+		case strikeMarkClose[0]:
+			if depth > 0 {
+				depth--
+			}
+		}
+	}
+	return depth > 0
 }
 
 var (

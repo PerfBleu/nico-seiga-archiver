@@ -77,31 +77,60 @@ var (
 	reTrailing = `.,;:!?'"”’、。，；：！？】」』）)]}`
 )
 
-// view 是一个文本的两种视图：原文（保留全角）与宽度归一化（全角转半角）。
-// 两者 rune 数量始终相同，因此同一 rune 下标可以互相映射。
+// 删除线的标记方式（由上游负责把各种写法统一成这两个哨兵）：
+//
+//	\x01 ... \x02
+//
+// 除此之外，extract 也直接识别 Markdown 的 ~~删除线~~ 和 Unicode 组合删除线 U+0336。
+const (
+	strikeOpen  = '\x01'
+	strikeClose = '\x02'
+)
+
+// view 是一个文本的两种视图，三者 rune 数量始终相同，下标可互相映射：
+//
+//	orig   —— 原文（保留全角）
+//	norm   —— 宽度归一化（全角转半角），用于 URL 匹配
+//	masked —— norm 的副本，但删除线范围内的字符替换成空格，
+//	          这样被划掉的 URL / 密码不会被匹配到
 type view struct {
-	orig []rune
-	norm []rune
+	orig   []rune
+	norm   []rune
+	masked []rune
+	struck []bool
 }
 
 func newView(s string) view {
-	orig := []rune(s)
+	clean, struck := maskStrike(s)
+	orig := clean
 	norm := make([]rune, len(orig))
+	masked := make([]rune, len(orig))
 	for i, r := range orig {
 		norm[i] = toHalfWidthRune(r)
+		if struck[i] {
+			masked[i] = ' '
+		} else {
+			masked[i] = norm[i]
+		}
 	}
-	return view{orig: orig, norm: norm}
+	return view{orig: orig, norm: norm, masked: masked, struck: struck}
 }
 
-// Links 从文本中提取所有 getuploader 下载页链接。
+// Links 从文本中提取可用（未被删除线划掉）的 getuploader 下载页链接。
 // 同一个 URL 只保留第一次出现的密码信息。
 func Links(text string) []Link {
+	usable, _ := LinksWithSkipped(text)
+	return usable
+}
+
+// LinksWithSkipped 返回可用链接，以及被删除线划掉、应当跳过的链接地址。
+func LinksWithSkipped(text string) (usable []Link, skipped []string) {
 	v := newView(text)
 	normText := string(v.norm)
 
 	matches := reURL.FindAllStringIndex(normText, -1)
 	if len(matches) == 0 {
-		return nil
+		return nil, nil
 	}
 	// 把字节下标换成 rune 下标，方便和原文对齐。
 	idx := runeIndexMap(normText)
@@ -110,14 +139,24 @@ func Links(text string) []Link {
 		runeMatches = append(runeMatches, [2]int{idx[m[0]], idx[m[1]]})
 	}
 
-	var out []Link
 	seen := map[string]bool{}
+	seenSkipped := map[string]bool{}
 	for i, m := range runeMatches {
 		// URL 本身取归一化视图，这样全角写法的链接也能识别。
 		raw := string(v.norm[m[0]:m[1]])
 		raw = strings.TrimRight(raw, reTrailing+"…")
 		normalized, ok := NormalizeURL(raw)
-		if !ok || seen[normalized] {
+		if !ok {
+			continue
+		}
+		if isStruck(v.struck, m[0], m[1]) {
+			if !seenSkipped[normalized] {
+				seenSkipped[normalized] = true
+				skipped = append(skipped, normalized)
+			}
+			continue
+		}
+		if seen[normalized] {
 			continue
 		}
 		seen[normalized] = true
@@ -140,15 +179,195 @@ func Links(text string) []Link {
 			end = runeMatches[i+1][0]
 		}
 
-		pw, source := passwordInSegment(v.orig[start:end], v.norm[start:end], m[1]-start)
-		out = append(out, Link{
+		// 密码只在非删除线区域里查找（masked 中被划掉的部分是空格）。
+		pw, source := passwordInSegment(v.orig[start:end], v.masked[start:end], m[1]-start)
+		usable = append(usable, Link{
 			URL:            normalized,
 			Password:       pw,
 			PasswordSource: source,
 			Context:        util.OneLine(string(v.orig[start:end])),
 		})
 	}
+	return usable, skipped
+}
+
+func isStruck(flags []bool, start, end int) bool {
+	if start < 0 {
+		start = 0
+	}
+	if end > len(flags) {
+		end = len(flags)
+	}
+	for i := start; i < end; i++ {
+		if flags[i] {
+			return true
+		}
+	}
+	return false
+}
+
+// MaskStrike 把「删除线」的几种写法统一成哨兵字符：
+//
+//	<s>/<del>/<strike>/strikethrough、style 含 line-through 的元素、
+//	Markdown 的 ~~文本~~、Unicode 组合删除线 U+0336。
+//
+// 供上游（例如 nico 简介解析）在需要保留格式信息时调用。
+func MaskStrike(text string) string {
+	text = htmlStrikeMarks(text)
+	text = markdownStrike(text)
+	text = combiningStrike(text)
+	return text
+}
+
+var reTagToken = regexp.MustCompile(`(?i)<\s*(/?)\s*([a-z][a-z0-9]*)\b[^>]*>`)
+
+// htmlStrikeMarks 把 HTML 的删除线标签换成哨兵，其余标签原样保留
+// （后续解析/剥离标签的逻辑还需要它们）。
+//
+// 用「元素名栈」判断闭合标签是否对应某个删除线元素，遇到 <br> 之类的
+// 空元素或自闭合标签不会打乱判断。标签不配对时视为解析失败，丢弃所有哨兵。
+func htmlStrikeMarks(s string) string {
+	if !strings.Contains(s, "<") {
+		return s
+	}
+	var (
+		b     strings.Builder
+		stack []string
+		pos   int
+	)
+	b.Grow(len(s) + 8)
+	for _, loc := range reTagToken.FindAllStringSubmatchIndex(s, -1) {
+		tag := s[loc[0]:loc[1]]
+		closing := loc[2] >= 0 && loc[3] > loc[2]
+		name := strings.ToLower(s[loc[4]:loc[5]])
+		b.WriteString(s[pos:loc[0]])
+		pos = loc[1]
+
+		if closing {
+			if n := len(stack); n > 0 && stack[n-1] == name {
+				stack = stack[:n-1]
+				b.WriteString(string(strikeClose))
+				continue
+			}
+			b.WriteString(tag)
+			continue
+		}
+		lowerTag := strings.ToLower(tag)
+		isStrike := isStrikeTagName(name) || strings.Contains(lowerTag, "line-through")
+		if !isStrike || strings.HasSuffix(strings.TrimSpace(tag), "/>") {
+			b.WriteString(tag)
+			continue
+		}
+		stack = append(stack, name)
+		b.WriteString(string(strikeOpen))
+	}
+	b.WriteString(s[pos:])
+
+	out := b.String()
+	if len(stack) > 0 {
+		// 有未闭合的删除线：视为解析失败，丢弃哨兵，避免误伤整段文字。
+		return stripStrikeMarks(out)
+	}
 	return out
+}
+
+func isStrikeTagName(name string) bool {
+	switch name {
+	case "s", "del", "strike", "strikethrough":
+		return true
+	}
+	return false
+}
+
+func stripStrikeMarks(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == strikeOpen || r == strikeClose {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+// maskStrike 把「删除线」的几种写法统一成哨兵字符，再剥掉哨兵生成 struck 标记。
+func maskStrike(text string) (clean []rune, struck []bool) {
+	text = MaskStrike(text)
+
+	rs := []rune(text)
+	clean = make([]rune, 0, len(rs))
+	struck = make([]bool, 0, len(rs))
+	depth := 0
+	for _, r := range rs {
+		switch r {
+		case strikeOpen:
+			depth++
+		case strikeClose:
+			if depth > 0 {
+				depth--
+			}
+		default:
+			clean = append(clean, r)
+			struck = append(struck, depth > 0)
+		}
+	}
+	return clean, struck
+}
+
+// markdownStrike 把 ~~文本~~ / ～～文本～～ 转成哨兵标记。
+func markdownStrike(s string) string {
+	if !strings.Contains(s, "~~") && !strings.Contains(s, "～～") {
+		return s
+	}
+	rs := []rune(s)
+	var b strings.Builder
+	b.Grow(len(s))
+	open := false
+	isPair := func(i int) bool {
+		return i+1 < len(rs) && (rs[i] == '~' || rs[i] == '～') && rs[i+1] == rs[i]
+	}
+	for i := 0; i < len(rs); i++ {
+		if isPair(i) {
+			if open {
+				b.WriteRune(strikeClose)
+			} else {
+				b.WriteRune(strikeOpen)
+			}
+			open = !open
+			i++
+			continue
+		}
+		b.WriteRune(rs[i])
+	}
+	if open {
+		// 没有闭合，标记无效，退回原文。
+		return stripStrikeMarks(b.String())
+	}
+	return b.String()
+}
+
+// combiningStrike 把「每个字符后跟 U+0336」的写法转成哨兵标记。
+func combiningStrike(s string) string {
+	if !strings.ContainsRune(s, 0x0336) {
+		return s
+	}
+	rs := []rune(s)
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(rs); {
+		if i+1 < len(rs) && rs[i+1] == 0x0336 {
+			b.WriteRune(strikeOpen)
+			j := i
+			for j+1 < len(rs) && rs[j+1] == 0x0336 {
+				b.WriteRune(rs[j])
+				j += 2
+			}
+			b.WriteRune(strikeClose)
+			i = j
+			continue
+		}
+		b.WriteRune(rs[i])
+		i++
+	}
+	return b.String()
 }
 
 // NormalizeURL 规范化 getuploader 链接。

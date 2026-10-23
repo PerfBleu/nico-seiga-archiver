@@ -33,11 +33,17 @@ type Stats struct {
 	Skipped      int
 	FailedFiles  int
 	IllustErrors int
+	// StruckLinks 是被删除线划掉、主动跳过的链接数量。
+	StruckLinks int
 }
 
 func (s Stats) String() string {
-	return fmt.Sprintf("投稿 %d 个，发现链接 %d 个，下载成功 %d 个，跳过 %d 个，失败 %d 个，投稿抓取失败 %d 个",
+	base := fmt.Sprintf("投稿 %d 个，发现链接 %d 个，下载成功 %d 个，跳过 %d 个，失败 %d 个，投稿抓取失败 %d 个",
 		s.Illusts, s.LinksFound, s.Downloaded, s.Skipped, s.FailedFiles, s.IllustErrors)
+	if s.StruckLinks > 0 {
+		base += fmt.Sprintf("，删除线跳过 %d 个", s.StruckLinks)
+	}
+	return base
 }
 
 // Archiver 是任务执行器。
@@ -160,6 +166,7 @@ func (a *Archiver) destDirFor(author string) string {
 }
 
 // ProcessIllust 处理一张静画投稿：抓信息 -> 提取链接 -> 逐个下载。
+// ProcessIllust 处理一张静画投稿：抓信息 -> 提取链接 -> 逐个下载。
 func (a *Archiver) ProcessIllust(ctx context.Context, rawURL string) (*nico.Illust, error) {
 	ill, err := a.nico.FetchIllust(ctx, rawURL)
 	if err != nil {
@@ -182,15 +189,28 @@ func (a *Archiver) ProcessIllust(ctx context.Context, rawURL string) (*nico.Illu
 		a.log.Warnf("  简介被截断，可能漏掉链接（可在 cfg 中设置 nico_cookie 以获取完整简介）")
 	}
 
-	links := extract.Links(ill.Description)
-	if len(links) == 0 {
-		a.log.Warnf("  简介中未找到 getuploader 下载链接")
+	// 被删除线划掉的链接一律跳过，只在日志里留个记录。
+	usable, skipped := extract.LinksWithSkipped(ill.Description)
+	for _, u := range skipped {
+		a.log.Warnf("  链接被删除线划掉，跳过: %s", u)
+	}
+	a.stats.StruckLinks += len(skipped)
+	if len(usable) == 0 {
+		if len(skipped) > 0 {
+			a.log.Warnf("  简介中的 %d 个 getuploader 链接都被划掉了，未找到可用链接", len(skipped))
+		} else {
+			a.log.Warnf("  简介中未找到 getuploader 下载链接")
+		}
 		return ill, nil
 	}
-	a.stats.LinksFound += len(links)
-	a.log.Infof("  发现 %d 个 getuploader 链接", len(links))
+	a.stats.LinksFound += len(usable)
+	if len(skipped) > 0 {
+		a.log.Infof("  发现 %d 个可用的 getuploader 链接（跳过了 %d 个被划掉的）", len(usable), len(skipped))
+	} else {
+		a.log.Infof("  发现 %d 个可用的 getuploader 链接", len(usable))
+	}
 
-	for _, link := range links {
+	for _, link := range usable {
 		if err := ctx.Err(); err != nil {
 			return ill, err
 		}
