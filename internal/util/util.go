@@ -69,6 +69,16 @@ func EnsureDir(dir string) error {
 	return os.MkdirAll(dir, 0o755)
 }
 
+// ExpandHome 把开头的 ~ 展开成用户主目录。
+func ExpandHome(p string) string {
+	if p == "~" || strings.HasPrefix(p, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, strings.TrimPrefix(p, "~"))
+		}
+	}
+	return p
+}
+
 // Truncate 按 rune 截断字符串。
 func Truncate(s string, maxRunes int) string {
 	if maxRunes <= 0 {

@@ -40,6 +40,8 @@ type CLI struct {
 	arch        *archiver.Archiver
 	pr          *prompt.Reader
 	out         io.Writer
+	// cliMode 表示本次是非交互的命令行调用（用于决定 help 输出哪种用法）。
+	cliMode bool
 }
 
 // New 创建 CLI。
@@ -69,28 +71,18 @@ func New() (*CLI, error) {
 	return c, nil
 }
 
-// Run 启动 REPL；args 非空时以非交互方式执行一条命令。
+// Run 启动 REPL；args 非空时以非交互方式执行一条命令后退出。
 func (c *CLI) Run(args []string) int {
 	defer func() {
 		c.saveHistory()
 		c.pr.Close()
 	}()
-	c.printBanner()
 
 	if len(args) > 0 {
-		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-		defer stop()
-		_, err := c.execute(ctx, strings.Join(args, " "))
-		if err != nil {
-			if isCancelled(err) {
-				c.log.Warnf("已取消。")
-				return 130
-			}
-			c.log.Errorf("%v", err)
-			return 1
-		}
-		return 0
+		return c.runOnce(args)
 	}
+
+	c.printBanner()
 
 	for {
 		line, err := c.pr.Line("archiver> ")
@@ -133,6 +125,49 @@ func (c *CLI) Run(args []string) int {
 			return 0
 		}
 	}
+}
+
+// runOnce 以非交互方式执行一条命令，返回进程退出码。
+//
+// 不打印 banner，方便脚本/管道使用。
+func (c *CLI) runOnce(argv []string) int {
+	c.cliMode = true
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	_, err := c.executeArgs(ctx, argv)
+	switch {
+	case err == nil:
+		return 0
+	case errors.Is(err, prompt.ErrInterrupted):
+		fmt.Fprintln(c.out)
+		c.log.Warnf("已取消。")
+		return 130
+	case isCancelled(err):
+		c.log.Warnf("已取消。")
+		return 130
+	default:
+		c.log.Errorf("%v", err)
+		return exitCodeFor(err)
+	}
+}
+
+// exitCodeFor 把错误映射成退出码。
+func exitCodeFor(err error) int {
+	var ue usageError
+	if errors.As(err, &ue) {
+		return 2
+	}
+	return 1
+}
+
+// usageError 表示参数用法错误（退出码 2）。
+type usageError struct{ msg string }
+
+func (e usageError) Error() string { return e.msg }
+
+func usagef(format string, args ...any) error {
+	return usageError{msg: fmt.Sprintf(format, args...)}
 }
 
 // promptLine 读取一行输入（历史 + 行内编辑）。
@@ -223,6 +258,7 @@ func (c *CLI) printBanner() {
 	}
 	fmt.Fprintln(c.out, "  输入 help 查看可用命令。")
 	if c.pr.Interactive() {
+		fmt.Fprintln(c.out, "  也可以直接用命令行参数调用：archiver --help")
 		fmt.Fprintln(c.out, "  ↑/↓ 翻命令历史 · Tab 补全 · Ctrl+C 取消当前操作 / 在提示符处退出")
 	}
 	fmt.Fprintln(c.out)
@@ -233,42 +269,41 @@ func (c *CLI) execute(ctx context.Context, line string) (exit bool, err error) {
 	if len(args) == 0 {
 		return false, nil
 	}
+	return c.executeArgs(ctx, args)
+}
 
-	// 提取通用 flag。
-	force := false
-	dryRun := false
-	restart := false
-	filtered := args[:0]
-	for _, a := range args {
-		switch a {
-		case "--force", "-f":
-			force = true
-		case "--dry-run", "-n":
-			dryRun = true
-		case "--restart":
-			restart = true
-		case "--debug":
-			c.cfg.LogLevel = "debug"
-			c.rebuild()
-		default:
-			filtered = append(filtered, a)
-		}
+// executeArgs 执行一条已切分好的命令（REPL 与命令行模式共用）。
+func (c *CLI) executeArgs(ctx context.Context, argv []string) (exit bool, err error) {
+	argv = inferCommand(argv)
+	opts, err := parseOptions(argv)
+	if err != nil {
+		return false, usageError{msg: err.Error()}
 	}
-	args = filtered
+	args := opts.argv
 	if len(args) == 0 {
-		return false, nil
+		return false, usagef("缺少命令，输入 archiver --help 查看用法")
 	}
 
+	// 只有 help/version 时才先应用参数（保证 --dir 等值能显示在帮助里）。
 	cmd := strings.ToLower(args[0])
 	rest := args[1:]
-
-	switch cmd {
-	case "help", "?", "h", "--help", "-h":
-		c.showHelp(rest)
+	if cmd == "help" || cmd == "?" || cmd == "h" {
+		opts.apply(c)
+		if c.cliMode {
+			c.printUsage()
+		} else {
+			c.showHelp(rest)
+		}
 		return false, nil
-	case "version", "--version", "-v":
+	}
+	if cmd == "version" {
 		fmt.Fprintf(c.out, "nico-seiga-archiver %s\n", version)
 		return false, nil
+	}
+
+	opts.apply(c)
+
+	switch cmd {
 	case "exit", "quit", "q":
 		return true, nil
 	case "clear", "cls":
@@ -284,9 +319,9 @@ func (c *CLI) execute(ctx context.Context, line string) (exit bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	arch.Force = force
-	arch.DryRun = dryRun
-	arch.Restart = restart
+	arch.Force = opts.force
+	arch.DryRun = opts.dryRun
+	arch.Restart = opts.restart
 	arch.ResetStats()
 
 	switch cmd {
@@ -303,13 +338,12 @@ func (c *CLI) execute(ctx context.Context, line string) (exit bool, err error) {
 	case "probe", "test":
 		return false, c.cmdProbe(ctx, arch)
 	case "stats":
-		c.log.Infof("%s", arch.Stats().String())
+		fmt.Fprintf(c.out, "%s\n", arch.Stats().String())
 		return false, nil
 	case "progress":
 		return false, c.cmdProgress(arch, rest)
 	default:
-		c.log.Warnf("未知命令: %s（输入 help 查看帮助）", args[0])
-		return false, nil
+		return false, usageError{msg: hintForUnknown(args[0])}
 	}
 }
 
@@ -336,7 +370,7 @@ func (c *CLI) rebuild() {
 
 func (c *CLI) cmdNicoSearch(ctx context.Context, a *archiver.Archiver, args []string) error {
 	if len(args) < 1 {
-		return errors.New("用法: nico-search <搜索页URL|关键词> [起始页]")
+		return usagef("用法: nico-search <搜索页URL|关键词> [起始页]")
 	}
 	input := strings.TrimSpace(args[0])
 	var listURL string
@@ -359,7 +393,7 @@ func (c *CLI) cmdNicoSearch(ctx context.Context, a *archiver.Archiver, args []st
 
 func (c *CLI) cmdNicoAuthor(ctx context.Context, a *archiver.Archiver, args []string) error {
 	if len(args) < 1 {
-		return errors.New("用法: nico-author <作者主页URL> [起始页]")
+		return usagef("用法: nico-author <作者主页URL> [起始页]")
 	}
 	pageURL, id, err := nico.NormalizeUserURL(args[0])
 	if err != nil {
@@ -374,7 +408,7 @@ func (c *CLI) cmdNicoAuthor(ctx context.Context, a *archiver.Archiver, args []st
 
 func (c *CLI) cmdNicoTag(ctx context.Context, a *archiver.Archiver, args []string) error {
 	if len(args) < 1 {
-		return errors.New("用法: nico-tag <tag|tag页面URL> [起始页]")
+		return usagef("用法: nico-tag <tag|tag页面URL> [起始页]")
 	}
 	listURL, tag, err := nico.NormalizeTagURL(args[0])
 	if err != nil {
@@ -434,7 +468,7 @@ func searchKeyAndLabel(input, listURL string) (string, string) {
 
 func (c *CLI) cmdNicoDown(ctx context.Context, a *archiver.Archiver, args []string) error {
 	if len(args) < 1 {
-		return errors.New("用法: nico-down <静画投稿URL>")
+		return usagef("用法: nico-down <静画投稿URL>")
 	}
 	ill, err := a.ProcessIllust(ctx, args[0])
 	if err != nil {
@@ -447,7 +481,7 @@ func (c *CLI) cmdNicoDown(ctx context.Context, a *archiver.Archiver, args []stri
 
 func (c *CLI) cmdDown(ctx context.Context, a *archiver.Archiver, args []string) error {
 	if len(args) < 1 {
-		return errors.New("用法: down <getuploader下载页URL> [密码]")
+		return usagef("用法: down <getuploader下载页URL> [密码]")
 	}
 	password := ""
 	if len(args) >= 2 {
@@ -472,7 +506,7 @@ func (c *CLI) cmdProgress(a *archiver.Archiver, args []string) error {
 		switch strings.ToLower(args[0]) {
 		case "clear", "reset":
 			if len(args) < 2 {
-				return errors.New("用法: progress clear <key|all>（progress 查看所有 key）")
+				return usagef("用法: progress clear <key|all>（progress 查看所有 key）")
 			}
 			target := args[1]
 			if strings.EqualFold(target, "all") || target == "*" {
@@ -571,7 +605,7 @@ func (c *CLI) cfgCommand(ctx context.Context, args []string) error {
 		return c.cmdProbe(ctx, a)
 	case "set":
 		if len(args) < 3 {
-			return errors.New("用法: cfg set <键> <值>（cfg show 查看可用的键）")
+			return usagef("用法: cfg set <键> <值>（cfg show 查看可用的键）")
 		}
 		return c.cfgSet(args[1], strings.Join(args[2:], " "))
 	case "reset":
@@ -859,7 +893,7 @@ cfg reset                  恢复默认配置
 `)
 	default:
 		fmt.Fprintf(c.out, `
-可用命令：
+交互模式（archiver>）可用命令：
   nico-search <url|关键词> [起始页]  用搜索页作为索引批量下载
   nico-tag <tag|url> [起始页]       用 tag 页面作为索引批量下载
   nico-author <url> [起始页]        用作者主页作为索引批量下载
@@ -871,6 +905,12 @@ cfg reset                  恢复默认配置
   stats                             显示本次会话的统计
   help [命令]                       查看详细帮助（help keys 查看快捷键）
   exit | quit                       退出
+
+命令行模式（不进 REPL，执行完就退出）：
+  archiver <命令> [参数...]         例如 archiver nico-tag VOICEROID 2
+  archiver <URL>                    直接粘贴链接，自动识别功能
+  archiver --help                   查看全部参数与示例
+  交互模式里的通用参数在这里同样可用，且可以放在命令前后任意位置。
 
 页码与续传：
   不写起始页时，如果该索引有历史进度，就从记录的页码继续下载；
@@ -892,6 +932,7 @@ Ctrl+C 的行为：
   --dry-run / -n 只扫描并报告将要下载的链接，不真正下载
   --restart      忽略历史进度，从第 1 页开始
   --debug        输出调试日志（HTTP 请求等）
+  更多参数（-d/--dir、-p/--proxy、--cookie、--delay、--timeout、-q）见 archiver --help
 
 下载文件会保存到：<下载目录>/<作者名>/<文件名>
 元数据（nico 地址、标题、作者、getuploader 地址、文件名、路径、MD5、SHA256）
