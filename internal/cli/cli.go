@@ -14,6 +14,7 @@ import (
 
 	"nico-seiga-archiver/internal/archiver"
 	"nico-seiga-archiver/internal/config"
+	"nico-seiga-archiver/internal/getuploader"
 	"nico-seiga-archiver/internal/logx"
 	"nico-seiga-archiver/internal/nico"
 	"nico-seiga-archiver/internal/prompt"
@@ -68,8 +69,6 @@ func New() (*CLI, error) {
 		_ = pr.LoadHistory(hp)
 	}
 	pr.SetCompleter(completeCommand)
-	// 尽早启用日志文件，启动阶段的问题也能留下记录。
-	c.attachLogFile()
 	return c, nil
 }
 
@@ -252,7 +251,8 @@ func completeCommand(line string) []string {
 
 var commandNames = []string{
 	"help", "version", "exit", "quit", "clear",
-	"nico-search", "nico-tag", "nico-author", "nico-down", "down",
+	"nico-search", "nico-tag", "nico-author", "nico-down",
+	"down", "down-catalog",
 	"cfg", "progress", "probe", "stats",
 }
 
@@ -328,6 +328,10 @@ func (c *CLI) executeArgs(ctx context.Context, argv []string) (exit bool, err er
 		return false, nil
 	}
 
+	// 从这里开始会真正执行任务，此时才启用日志文件，
+	// 避免 --version / --help / exit 这类操作也生成一个空日志。
+	c.attachLogFile()
+
 	if cmd == "cfg" || cmd == "config" {
 		return false, c.cfgCommand(ctx, rest)
 	}
@@ -352,6 +356,8 @@ func (c *CLI) executeArgs(ctx context.Context, argv []string) (exit bool, err er
 		return false, c.cmdNicoDown(ctx, arch, rest)
 	case "down", "d":
 		return false, c.cmdDown(ctx, arch, rest)
+	case "down-catalog", "catalog", "dc":
+		return false, c.cmdDownCatalog(ctx, arch, rest)
 	case "probe", "test":
 		return false, c.cmdProbe(ctx, arch)
 	case "stats":
@@ -515,6 +521,70 @@ func (c *CLI) cmdDown(ctx context.Context, a *archiver.Archiver, args []string) 
 	c.log.Infof("完成: %s (%s)", res.Path, util.HumanBytes(res.Bytes))
 	c.log.Infof("SHA256: %s", res.SHA256)
 	return nil
+}
+
+// parseCatalogArgs 解析 down-catalog 的位置参数：<url> [密码] [页码]。
+//
+// 密码可能是纯数字（如 2525），因此不能靠「是不是数字」判断它是密码还是页码，
+// 只能按位置解释；只想要页码时用 "-" 占位。
+func parseCatalogArgs(args []string) (password string, page int, err error) {
+	page = 1
+	if len(args) < 1 {
+		return "", 0, usagef("用法: down-catalog <上传者目录URL> [密码] [页码]")
+	}
+	if len(args) >= 2 {
+		password = strings.TrimSpace(args[1])
+		switch strings.ToLower(password) {
+		case "", "-", "none", "--":
+			password = ""
+		}
+	}
+	if len(args) >= 3 {
+		n, convErr := strconv.Atoi(strings.TrimSpace(args[2]))
+		if convErr != nil || n <= 0 {
+			return "", 0, usagef("页码必须是正整数: %s", args[2])
+		}
+		page = n
+	}
+	if len(args) > 3 {
+		return "", 0, usagef("参数过多: %s（用法: down-catalog <目录URL> [密码] [页码]）", strings.Join(args[3:], " "))
+	}
+	return password, page, nil
+}
+
+// cmdDownCatalog 把 getuploader 上传者主页当作目录，下载其中所有文件。
+func (c *CLI) cmdDownCatalog(ctx context.Context, a *archiver.Archiver, args []string) error {
+	if len(args) < 1 {
+		return usagef("用法: down-catalog <上传者目录URL> [密码] [页码]")
+	}
+	ref, err := getuploader.ParseCatalogURL(args[0])
+	if err != nil {
+		return err
+	}
+	password, page, err := parseCatalogArgs(args)
+	if err != nil {
+		return err
+	}
+
+	key := ref.Key()
+	explicit := page > 1
+	if !explicit && !a.Restart {
+		if e, ok := a.ResumePage(key); ok && e.LastPage > 0 {
+			note := ""
+			if e.Completed {
+				note = "，上次已翻到最后一页"
+			}
+			c.log.Infof("检测到历史进度 %s：上次停在第 %d 页%s，从该页继续（--restart 可从头开始）", key, e.LastPage, note)
+			page = e.LastPage
+		}
+	} else if a.Restart {
+		c.log.Infof("已忽略历史进度（--restart），从第 1 页开始")
+	}
+	if password != "" {
+		c.log.Infof("将对该目录内需要密码的文件使用密码: %s", password)
+	}
+	c.log.Stepf("开始下载上传者目录: %s（%s，从第 %d 页开始）", ref.Root, ref.Account, page)
+	return a.ProcessCatalog(ctx, ref, password, page, key, ref.Label())
 }
 
 // cmdProgress 查看或清除索引下载进度。
@@ -902,6 +972,22 @@ down <getuploader下载页URL> [密码]
     down https://uu.getuploader.com/harinashi/download/71 2525
     down https://uu.getuploader.com/harinashi/download/71 ２５２５
 `)
+	case "down-catalog", "catalog":
+		fmt.Fprint(c.out, `
+down-catalog <上传者目录URL> [密码] [页码]
+  把 getuploader 的上传者主页当作目录，逐页下载其中的所有文件。
+  - 密码会用于该目录下所有需要密码的文件；省略时按需询问。
+  - 参数按顺序解释：第二个是密码，第三个才是页码（密码可能是纯数字）。
+    只想要页码时用 "-" 占位。
+  - 不写页码时，若有历史进度就从记录的页码继续（--restart 可从头开始）。
+  - 文件保存到 <下载目录>/<上传者账号>/。
+  例：
+    down-catalog https://ux.getuploader.com/SHINOBILI7/
+    down-catalog https://ux.getuploader.com/SHINOBILI7/ 2525
+    down-catalog https://ux.getuploader.com/SHINOBILI7/ 2525 2
+    down-catalog https://ux.getuploader.com/SHINOBILI7/ - 2
+    archiver https://ux.getuploader.com/SHINOBILI7/ 2525 2
+`)
 	case "cfg", "config":
 		fmt.Fprint(c.out, `
 cfg                        进入配置向导
@@ -934,6 +1020,7 @@ cfg reset                  恢复默认配置
   nico-author <url> [起始页]        用作者主页作为索引批量下载
   nico-down <url>                   处理单个 nico 静画投稿
   down <url> [密码]                 直接下载一个 getuploader 链接
+  down-catalog <url> [密码] [页码]  把 getuploader 上传者主页当作目录批量下载
   cfg [show|set|path|test|reset]    配置（Cookie / 下载目录 / 代理等）
   progress [clear <key|all>]        查看 / 清除索引下载进度
   probe                             检查 nico / getuploader 连通性

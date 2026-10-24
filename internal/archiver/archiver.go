@@ -35,15 +35,30 @@ type Stats struct {
 	IllustErrors int
 	// StruckLinks 是被删除线划掉、主动跳过的链接数量。
 	StruckLinks int
+	// CatalogPages/CatalogItems 是 down-catalog 的目录页数与文件数。
+	CatalogPages int
+	CatalogItems int
 }
 
 func (s Stats) String() string {
-	base := fmt.Sprintf("投稿 %d 个，发现链接 %d 个，下载成功 %d 个，跳过 %d 个，失败 %d 个，投稿抓取失败 %d 个",
-		s.Illusts, s.LinksFound, s.Downloaded, s.Skipped, s.FailedFiles, s.IllustErrors)
-	if s.StruckLinks > 0 {
-		base += fmt.Sprintf("，删除线跳过 %d 个", s.StruckLinks)
+	parts := make([]string, 0, 6)
+	if s.CatalogItems > 0 || (s.Illusts == 0 && s.CatalogPages > 0) {
+		parts = append(parts, fmt.Sprintf("目录页 %d 页", s.CatalogPages), fmt.Sprintf("目录文件 %d 个", s.CatalogItems))
+	} else {
+		parts = append(parts, fmt.Sprintf("投稿 %d 个", s.Illusts), fmt.Sprintf("发现链接 %d 个", s.LinksFound))
 	}
-	return base
+	parts = append(parts,
+		fmt.Sprintf("下载成功 %d 个", s.Downloaded),
+		fmt.Sprintf("跳过 %d 个", s.Skipped),
+		fmt.Sprintf("失败 %d 个", s.FailedFiles),
+	)
+	if s.IllustErrors > 0 {
+		parts = append(parts, fmt.Sprintf("投稿抓取失败 %d 个", s.IllustErrors))
+	}
+	if s.StruckLinks > 0 {
+		parts = append(parts, fmt.Sprintf("删除线跳过 %d 个", s.StruckLinks))
+	}
+	return strings.Join(parts, "，")
 }
 
 // Archiver 是任务执行器。
@@ -249,68 +264,22 @@ func (a *Archiver) downloadLink(ctx context.Context, ill *nico.Illust, link extr
 		return
 	}
 
-	var (
-		lastErr         error
-		attempts        int
-		anyPasswordUsed bool
-	)
-	// tryAll 按顺序尝试一组密码（原文优先，其次半角）。
-	// 返回 true 表示下载成功；返回 false 时 lastErr 是最后一次的错误。
-	tryAll := func(candidates []string) bool {
-		if len(candidates) == 0 {
-			candidates = []string{""}
-		}
-		for i, pw := range candidates {
-			if i > 0 {
-				a.log.Infof("  密码未通过，改用半角写法重试: %s", pw)
-			}
-			attempts++
-			res, err := a.gu.Download(ctx, link.URL, pw, destDir, a.Force)
-			if err == nil {
-				a.recordSuccess(ill, link.URL, res, pw != "")
-				a.stats.Downloaded++
-				return true
-			}
-			lastErr = err
-			if strings.TrimSpace(pw) != "" {
-				anyPasswordUsed = true
-			}
-			// 不是密码问题（网络、页面结构等）就没必要换密码了。
-			if !isPasswordError(err) {
-				return false
-			}
-		}
-		return false
-	}
-
-	if tryAll(extract.PasswordAlternates(password)) {
-		return
-	}
-
-	// 自动提取的密码（含半角转换）都失败时，询问用户。
-	for isPasswordError(lastErr) && a.AskPassword != nil && a.cfg.AskPassword && attempts < 6 {
-		reason := "需要下载密码"
-		if errors.Is(lastErr, getuploader.ErrPasswordRejected) {
-			reason = "密码错误，请重新输入"
-		}
-		a.log.Warnf("  %s", reason)
-		np, perr := a.AskPassword(hint)
-		if perr != nil {
-			if errors.Is(perr, ErrCanceled) {
-				a.stats.Skipped++
-				a.log.Infof("  已跳过该链接（用户取消）")
-				return
-			}
-			lastErr = perr
-			break
-		}
-		if strings.TrimSpace(np) == "" {
-			break
-		}
-		a.log.Infof("  使用手动输入的密码重试...")
-		if tryAll(extract.PasswordAlternates(np)) {
+	out, err := a.downloadFile(ctx, downloadOptions{
+		URL:      link.URL,
+		DestDir:  destDir,
+		Password: password,
+		Hint:     hint,
+		Indent:   "  ",
+	})
+	if err == nil {
+		if out.Canceled {
+			a.stats.Skipped++
+			a.log.Infof("  已跳过该链接（用户取消）")
 			return
 		}
+		a.recordSuccess(ill, link.URL, out.Result, out.PasswordUsed != "")
+		a.stats.Downloaded++
+		return
 	}
 
 	a.stats.FailedFiles++
@@ -320,7 +289,7 @@ func (a *Archiver) downloadLink(ctx context.Context, ill *nico.Illust, link extr
 		a.log.Warnf("  已取消: %s", link.URL)
 		return
 	}
-	a.log.Errorf("  下载失败: %s (%v)", link.URL, lastErr)
+	a.log.Errorf("  下载失败: %s (%v)", link.URL, err)
 	_ = a.store.Add(metadata.Record{
 		NicoURL:        ill.URL,
 		NicoID:         ill.ID,
@@ -328,9 +297,9 @@ func (a *Archiver) downloadLink(ctx context.Context, ill *nico.Illust, link extr
 		Author:         ill.Author,
 		AuthorURL:      ill.AuthorURL,
 		GetuploaderURL: link.URL,
-		PasswordUsed:   anyPasswordUsed,
+		PasswordUsed:   out.PasswordUsed != "",
 		Status:         metadata.StatusFailed,
-		Error:          errString(lastErr),
+		Error:          errString(err),
 	})
 }
 
@@ -376,6 +345,10 @@ func (a *Archiver) ProcessList(ctx context.Context, rawURL string, startPage int
 		maxPages = 500
 	}
 	record := func(page int, completed bool) {
+		if a.DryRun {
+			// 只扫描不下载时不更新进度，避免污染下一次正式运行。
+			return
+		}
 		if a.progress == nil || progressKey == "" {
 			return
 		}
@@ -420,7 +393,7 @@ func (a *Archiver) ProcessList(ctx context.Context, rawURL string, startPage int
 		}
 		current = page.NextURL
 	}
-	if a.progress != nil && progressKey != "" {
+	if a.progress != nil && progressKey != "" && !a.DryRun {
 		a.log.Infof("进度已记录：%s → 第 %d 页（下次未指定页码时从这里继续）", progressKey, lastPage)
 	}
 	a.log.Infof("%s", a.stats.String())
@@ -439,65 +412,34 @@ func (a *Archiver) DirectDownload(ctx context.Context, guURL, password string) (
 		return nil, nil
 	}
 
-	var (
-		lastErr         error
-		attempts        int
-		anyPasswordUsed bool
-	)
-	tryAll := func(candidates []string) (*getuploader.Result, bool) {
-		if len(candidates) == 0 {
-			candidates = []string{""}
-		}
-		for i, pw := range candidates {
-			if i > 0 {
-				a.log.Infof("密码未通过，改用半角写法重试: %s", pw)
-			}
-			attempts++
-			res, err := a.gu.Download(ctx, guURL, pw, a.cfg.DownloadDir, a.Force)
-			if err == nil {
-				return res, true
-			}
-			lastErr = err
-			if strings.TrimSpace(pw) != "" {
-				anyPasswordUsed = true
-			}
-			if !isPasswordError(err) {
-				return nil, false
-			}
-		}
-		return nil, false
+	out, err := a.downloadFile(ctx, downloadOptions{
+		URL:      guURL,
+		DestDir:  a.cfg.DownloadDir,
+		Password: password,
+		Hint:     "getuploader 下载页\n" + guURL,
+	})
+	switch {
+	case err == nil && out.Canceled:
+		a.log.Infof("已取消该下载。")
+		return nil, nil
+	case err == nil:
+		a.recordSuccess(nil, guURL, out.Result, out.PasswordUsed != "")
+		a.stats.Downloaded++
+		return out.Result, nil
 	}
 
-	res, ok := tryAll(extract.PasswordAlternates(password))
-	for !ok && isPasswordError(lastErr) && a.AskPassword != nil && a.cfg.AskPassword && attempts < 6 {
-		np, perr := a.AskPassword("getuploader 下载页\n" + guURL)
-		if errors.Is(perr, ErrCanceled) {
-			a.log.Infof("已取消该下载。")
-			return nil, nil
-		}
-		if perr != nil || strings.TrimSpace(np) == "" {
-			break
-		}
-		res, ok = tryAll(extract.PasswordAlternates(np))
+	if ctx.Err() != nil {
+		a.log.Warnf("已取消: %s", guURL)
+		return nil, ctx.Err()
 	}
-
-	if !ok {
-		if ctx.Err() != nil {
-			a.log.Warnf("已取消: %s", guURL)
-			return nil, ctx.Err()
-		}
-		a.stats.FailedFiles++
-		_ = a.store.Add(metadata.Record{
-			GetuploaderURL: guURL,
-			PasswordUsed:   anyPasswordUsed,
-			Status:         metadata.StatusFailed,
-			Error:          errString(lastErr),
-		})
-		return nil, lastErr
-	}
-	a.recordSuccess(nil, guURL, res, anyPasswordUsed)
-	a.stats.Downloaded++
-	return res, nil
+	a.stats.FailedFiles++
+	_ = a.store.Add(metadata.Record{
+		GetuploaderURL: guURL,
+		PasswordUsed:   out.PasswordUsed != "",
+		Status:         metadata.StatusFailed,
+		Error:          errString(err),
+	})
+	return nil, err
 }
 
 func errString(err error) string {
@@ -505,6 +447,13 @@ func errString(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+func orDefault(s, def string) string {
+	if strings.TrimSpace(s) == "" {
+		return def
+	}
+	return s
 }
 
 func orNoPassword(p string) string {

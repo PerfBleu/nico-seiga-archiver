@@ -188,7 +188,7 @@ func (o options) apply(c *CLI) bool {
 	if changed || o.debug || o.quiet {
 		c.cfg.Normalize()
 		c.rebuild()
-		c.attachLogFile()
+		// 日志文件在 executeArgs 里统一启用（help/version 之类不需要）。
 	}
 	return changed
 }
@@ -202,6 +202,7 @@ func isKnownCommand(s string) bool {
 		"nico-author", "author", "na",
 		"nico-down", "nico", "nd",
 		"down", "d",
+		"down-catalog", "catalog", "dc",
 		"cfg", "config", "progress", "probe", "test", "stats":
 		return true
 	}
@@ -234,6 +235,9 @@ func inferCommand(argv []string) []string {
 	switch {
 	case strings.Contains(low, "getuploader.com/") && strings.Contains(low, "/download/"):
 		return prefix("down")
+	case strings.Contains(low, "getuploader.com/"):
+		// 上传者主页（目录）—— 例如 https://ux.getuploader.com/SHINOBILI7/
+		return prefix("down-catalog")
 	case strings.Contains(low, "/tag/"):
 		return prefix("nico-tag")
 	case strings.Contains(low, "/user/illust/"):
@@ -278,6 +282,7 @@ func (c *CLI) printUsage() {
   nico-author <url> [页码]              用作者主页作为索引批量下载
   nico-down <url>                       处理单个 nico 静画投稿
   down <url> [密码]                     直接下载一个 getuploader 链接
+  down-catalog <url> [密码] [页码]      把 getuploader 上传者主页当作目录批量下载
   cfg <show|set|path|test|reset>         配置（交互式 cfg 向导请进入 REPL）
   progress [clear <key|all>]             查看 / 清除索引下载进度
   probe                                 检查 nico / getuploader 连通性
@@ -313,6 +318,7 @@ func (c *CLI) printUsage() {
   archiver nico-author https://seiga.nicovideo.jp/user/illust/39911624 -q
   archiver https://seiga.nicovideo.jp/seiga/im11691748
   archiver down https://uu.getuploader.com/harinashi/download/71 2525
+  archiver down-catalog https://ux.getuploader.com/SHINOBILI7/ 2525 2
   archiver nico-tag 立ち絵 -d ~/seiga --proxy http://127.0.0.1:7897
 
 `, version, orDash(c.cfgPath), c.cfg.DownloadDir, orDash(pr.URL), pr.Source, orDash(c.cfg.LogPath()))

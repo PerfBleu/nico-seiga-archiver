@@ -183,10 +183,10 @@ func (c *Client) loadPage(ctx context.Context, rawURL, referer string) (*html.No
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("打开下载页失败: HTTP %d %s", resp.StatusCode, rawURL)
+		return nil, fmt.Errorf("打开页面失败: HTTP %d %s", resp.StatusCode, rawURL)
 	}
 	if !isHTMLResponse(resp) {
-		return nil, errors.New("下载页返回了非 HTML 内容")
+		return nil, errors.New("页面返回了非 HTML 内容")
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
 	if err != nil {

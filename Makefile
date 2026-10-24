@@ -32,6 +32,7 @@ endif
 # 目标平台（跨平台编译时可覆盖）
 GOOS_LINUX   ?= linux
 GOOS_WINDOWS ?= windows
+GOOS_DARWIN   ?= darwin
 GOARCH       ?= amd64
 
 # 纯 Go 项目，关掉 cgo 才能真正做到跨平台交叉编译
@@ -44,6 +45,7 @@ LDFLAGS    := -s -w -X '$(APP)/internal/cli.version=$(VERSION)'
 # 输出文件名：Windows 需要 .exe 后缀
 LINUX_BIN   := $(OUTDIR)/$(BINARY)-$(GOOS_LINUX)-$(GOARCH)
 WINDOWS_BIN := $(OUTDIR)/$(BINARY)-$(GOOS_WINDOWS)-$(GOARCH).exe
+DARWIN_BIN   := $(OUTDIR)/$(BINARY)-$(GOOS_DARWIN)-$(GOARCH)
 
 HOST_OS   := $(shell $(GO) env GOOS)
 HOST_ARCH := $(shell $(GO) env GOARCH)
@@ -83,6 +85,18 @@ elf: ## 编译 Linux ELF（默认 amd64）
 	GOOS=$(GOOS_LINUX) GOARCH=$(GOARCH) CGO_ENABLED=0 \
 		$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(LINUX_BIN) .
 	@echo "已生成: $(LINUX_BIN)"
+
+darwin_x86:
+	@mkdir -p $(OUTDIR)
+	GOOS=$(GOOS_DARWIN) GOARCH=$(GOARCH) CGO_ENABLED=0 \
+		$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(DARWIN_BIN) .
+	@echo "已生成: $(DARWIN_BIN)"
+
+darwin_m:
+	@mkdir -p $(OUTDIR)
+	GOOS=$(GOOS_DARWIN) GOARCH=$(GOARCH) CGO_ENABLED=0 \
+		$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(DARWIN_BIN) .
+	@echo "已生成: $(DARWIN_BIN)"
 
 windows: exe ## 编译 Windows EXE
 
