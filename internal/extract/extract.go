@@ -46,21 +46,38 @@ const (
 	pwGap = `[ \t\x{3000}]*(?:\r?\n[ \t\x{3000}]*)?`
 	// 连接符：日文助词、冒号、等号、箭头、破折号、括号开头等
 	pwSep = `(?:は|を|が|:|：|=|＝|＞|>|→|⇒|≫|-|–|—|ー|【|\[|（|\(|「|『|、|，|,|::|：：|：)?`
+	// 英文里常见「password is xxx / password are xxx」
+	pwVerb = `(?:\bis\b\s*|\bare\b\s*)?`
+	// 插入语：关键词与密码之间夹的说明文字，例如
+	// 「DLパスワードはどちらも「sik2」です」里的「どちらも」。
+	// 只允许「非密码、非括号」字符并限长，非贪婪。
+	pwFiller = `[^A-Za-z0-9!@#$%^&*_.【】\[\]（）()「」『』"'“”-]{1,24}?`
+	// 密码外面可能包一层括号或引号：软版本可省略，硬版本必须出现
+	pwOpenSoft  = `(?:【|\[|（|\(|「|『|"|'|“|”)?`
+	pwCloseSoft = `(?:】|\]|）|\)|」|』|"|'|“|”)?`
+	pwOpenHard  = `(?:【|\[|（|\(|「|『|"|'|“|”)`
 	// 密码本体：ASCII 可见字符；全角字符在归一化视图里会映射成半角后再匹配。
 	pwBody = `([A-Za-z0-9!@#$%^&*_\-\.]{2,24})`
 )
+
+// 关键词列表：长的写在前面，保证「パスワード」不会被「パス」抢先匹配。
+const kwJP = `(?:ダウンロードパスワード|DLパスワード|dlパスワード|パスワード|パスコード|暗証番号|合言葉|キーコード|パスキー|パス|キー|ぱす|pass\(共通\)|ﾊﾟｽﾜｰﾄﾞ)`
+
+// 英文关键词用 \b 避免匹配到 bypass、keyword 之类单词内部。
+const kwEN = `(?i)\b(?:password|passwd|passcode|pwd|pass|pw|key)\b`
 
 var (
 	// 允许省略 scheme，也允许 getuploader.com 的各种子域名。
 	reURL = regexp.MustCompile(`(?i)(?:https?://)?(?:[a-z0-9-]+\.)*getuploader\.com/[^\s<>"' \x{3000}【】（）()「」『』\[\]]+`)
 
-	// 日文关键词：パスワード / パスワードは / パスコード / パス / キー 等。
-	// 长的写在前面，保证「パスワード」不会被「パス」抢先匹配。
-	rePassJP = regexp.MustCompile(`(?:ダウンロードパスワード|パスワード|パスコード|暗証番号|合言葉|キーコード|パスキー|パス|キー|ぱす|pass\(共通\)|ﾊﾟｽﾜｰﾄﾞ|パスワード)` + pwGap + pwSep + pwGap + pwBody)
+	// A：关键词后直接（允许空白/连接符）跟密码。
+	rePassJPA = regexp.MustCompile(kwJP + pwGap + pwSep + pwVerb + pwGap + pwOpenSoft + pwBody + pwCloseSoft)
+	// B：关键词和密码之间夹着说明文字，此时要求密码被括号/引号包住，
+	//    以免把后面的普通英文单词误当成密码。
+	rePassJPB = regexp.MustCompile(kwJP + pwGap + pwSep + pwVerb + pwFiller + pwOpenHard + pwBody + pwCloseSoft)
 
-	// 英文关键词：password / pass / pw / pwd / passwd / passcode / key。
-	// 用 \b 避免匹配到 bypass、keyword 之类单词内部。
-	rePassEN = regexp.MustCompile(`(?i)\b(?:password|passwd|passcode|pwd|pass|pw|key)\b` + pwGap + pwSep + pwGap + pwBody)
+	rePassENA = regexp.MustCompile(kwEN + pwGap + pwSep + pwVerb + pwGap + pwOpenSoft + pwBody + pwCloseSoft)
+	rePassENB = regexp.MustCompile(kwEN + pwGap + pwSep + pwVerb + pwFiller + pwOpenHard + pwBody + pwCloseSoft)
 
 	// URL 后面紧跟的数字/字母组合，例如「.../download/71 2525」
 	reAfterURLDigits = regexp.MustCompile(`^[\s\x{3000}、,，。:：=＝\-–—|｜/／]*([A-Za-z0-9]{3,16})\b`)
@@ -72,7 +89,7 @@ var (
 	reBareDigits = regexp.MustCompile(`(?:^|[\s\x{3000}、,，/／|｜:：=＝【\[（(「『])(\d{3,8})(?:$|[\s\x{3000}、,，/／|｜】\]）)」』])`)
 
 	// 所有「关键词 + 密码」形式的正则，按顺序尝试，取最靠近 URL 的那个。
-	keywordPatterns = []*regexp.Regexp{rePassJP, rePassEN}
+	keywordPatterns = []*regexp.Regexp{rePassJPA, rePassJPB, rePassENA, rePassENB}
 
 	reTrailing = `.,;:!?'"”’、。，；：！？】」』）)]}`
 )

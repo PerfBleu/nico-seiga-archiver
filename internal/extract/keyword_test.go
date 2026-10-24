@@ -130,3 +130,82 @@ func TestFullWidthSymbolNormalization(t *testing.T) {
 		}
 	}
 }
+
+// TestKeywordWithFiller 覆盖「关键词 … 插入语 … 密码」这类写法。
+func TestKeywordWithFiller(t *testing.T) {
+	cases := []struct {
+		name string
+		text string
+		want string
+	}{
+		{
+			name: "DLパスワードはどちらも「…」です",
+			text: "https://uu.getuploader.com/a/download/1\nDLパスワードはどちらも「sik2」です）",
+			want: "sik2",
+		},
+		{
+			name: "パスワードは共通で「…」",
+			text: "https://uu.getuploader.com/a/download/2\nパスワードは共通で「sik2」",
+			want: "sik2",
+		},
+		{
+			name: "パスワードはこちら「…」を入力",
+			text: "https://uu.getuploader.com/a/download/3\nパスワードはこちら「sik2」を入力してください",
+			want: "sik2",
+		},
+		{
+			name: "パスワードは全角括号",
+			text: "https://uu.getuploader.com/a/download/4\nパスワードは（２５２５）です",
+			want: "２５２５",
+		},
+		{
+			name: "英文 password is 引号",
+			text: "https://uu.getuploader.com/a/download/5\npassword is \"abcd1234\"",
+			want: "abcd1234",
+		},
+		{
+			name: "英文 password is 无引号",
+			text: "https://uu.getuploader.com/a/download/6\npassword is abcd1234",
+			want: "abcd1234",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			links := Links(tc.text)
+			if len(links) != 1 {
+				t.Fatalf("got %d links: %+v", len(links), links)
+			}
+			if got := links[0].Password; got != tc.want {
+				t.Errorf("password = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestKeywordFillerNeedsBrackets 插入语之后必须跟着括号里的密码，
+// 否则普通英文单词不该被当成密码。
+func TestKeywordFillerNeedsBrackets(t *testing.T) {
+	for _, text := range []string{
+		"https://uu.getuploader.com/a/download/1\nパスワードは後ほどお知らせします。ABC",
+		"https://uu.getuploader.com/a/download/2\nパスワードは別途ご連絡します ZIP",
+	} {
+		links := Links(text)
+		if len(links) != 1 {
+			t.Fatalf("got %d links", len(links))
+		}
+		if links[0].Password != "" {
+			t.Errorf("%q: 不应提取到密码，得到 %q", text, links[0].Password)
+		}
+	}
+}
+
+// TestKeywordDirectStillWins 关键词后紧跟密码时，插入语规则不应干扰。
+func TestKeywordDirectStillWins(t *testing.T) {
+	links := Links("https://uu.getuploader.com/a/download/1\nパスワードは「sik2」もあり 2525")
+	if len(links) != 1 {
+		t.Fatalf("got %d links", len(links))
+	}
+	if got := links[0].Password; got != "sik2" {
+		t.Errorf("password = %q, want sik2（应取最靠前的那一个）", got)
+	}
+}
